@@ -296,6 +296,12 @@ const TH = {
   // released — that headroom is what lets you SPREAD to grow the orb.
   // Sits below a real open hand (measured 1.27) so opening still exits.
   PINCH_HOLD:  0.98,
+  // MIDDLE + thumb pinch = colour picking. Deliberately a different pair from
+  // the orb gesture so the two can never fight: an index pinch curls the index
+  // IN, this one leaves it extended to act as the pointer.
+  MPINCH_IN:   0.34,   // thumb <-> middle tip gap to enter
+  MPINCH_OUT:  0.52,   // ...and to leave (hysteresis)
+  MPINCH_IDX:  1.05,   // index must stay EXTENDED — it's the cursor
 };
 const TH_DEFAULTS = { ...TH };
 const Z_WEIGHT    = 0.5;    // MediaPipe z is noisy — count it, but at half weight
@@ -315,12 +321,16 @@ const PARAMS = {
   OPEN:  { damping:0.960, handForce:9.0, orbForce:0.0,  noise:0.55, homePull:0.00, freeze:0 },
   FIST:  { damping:0.900, handForce:0.0, orbForce:0.0,  noise:0.00, homePull:0.00, freeze:1 },
   PINCH: { damping:0.880, handForce:0.0, orbForce:26.0, noise:0.00, homePull:0.00, freeze:0 },
+  // colour picking: calm drift so the field reads as a live colour preview
+  // rather than competing for attention while you aim
+  COLOR: { damping:0.975, handForce:0.0, orbForce:0.0,  noise:0.30, homePull:0.12, freeze:0 },
 };
 const DESC = {
   IDLE:  'waiting for a hand',
   OPEN:  'flowing with hand motion',
   FIST:  'frozen — held mid-flight',
   PINCH: 'gathered into a sphere',
+  COLOR: 'colour picker — point with your index',
 };
 
 /* ─────────────────────────── dom ─────────────────────────── */
@@ -548,6 +558,10 @@ function toWorld(lm) {
 // per-finger extension memory, so hysteresis is stateful per digit
 const extState = [false, false, false, false];
 let pinchState = false;
+let mPinchState = false;   // thumb + middle, colour-pick gesture
+const idxTip = { x: 0, y: 0, has: false };   // index tip in normalized 0..1 screen space
+let gesturePick = false;                     // is hand colour-picking armed?
+const aim = { x: 0, y: 0, on: false };       // live fingertip position inside the wheel
 
 // release burst state
 const burst = { t: 0, x: 0, y: 0, z: 0, power: 0 };
@@ -886,6 +900,20 @@ function classify(lm) {
   const gateOK = idxOut   > TH.PINCH_IDX
               && thumbOut > TH.PINCH_THUMB
               && othersOut >= 2;
+  // ── COLOUR PICK: thumb + MIDDLE finger, index left extended as the cursor.
+  // Checked before the orb pinch because the two are mutually exclusive by
+  // construction: this one requires the index OUT, the orb pinch curls it IN.
+  const midPinch = d3(lm[4], lm[12], scale);    // thumb tip <-> middle tip
+  dbg.midD = midPinch;
+  if (gesturePick) {
+    const idxExtended = idxOut > TH.MPINCH_IDX;
+    const mExit = mPinchState ? TH.MPINCH_OUT : TH.MPINCH_IN;
+    mPinchState = idxExtended && thumbOut > TH.PINCH_THUMB && midPinch < mExit;
+    if (mPinchState) return 'COLOR';
+  } else {
+    mPinchState = false;
+  }
+
   // Asymmetric exit: entering needs a tight gap (PINCH_IN), but once held the
   // gap may open all the way to PINCH_HOLD. That headroom is what lets the
   // user spread thumb+index to resize the orb without dropping the gesture.
@@ -934,6 +962,17 @@ function drawSkeleton(lm) {
     octx.strokeStyle = 'rgba(120,225,255,0.7)';
     octx.lineWidth = 2;
     octx.beginPath(); octx.arc(cx, cy, rPx, 0, Math.PI*2); octx.stroke();
+  }
+  if (gesture === 'COLOR') {
+    // thumb–middle contact line, plus a highlighted index tip (the cursor)
+    octx.strokeStyle = 'rgba(255,255,255,0.9)';
+    octx.lineWidth = 3;
+    octx.beginPath(); octx.moveTo(px(4),py(4)); octx.lineTo(px(12),py(12)); octx.stroke();
+    octx.fillStyle = 'rgba(255,255,255,0.95)';
+    octx.beginPath(); octx.arc(px(8), py(8), 9, 0, Math.PI*2); octx.fill();
+    octx.strokeStyle = 'rgba(120,225,255,0.9)';
+    octx.lineWidth = 2;
+    octx.beginPath(); octx.arc(px(8), py(8), 16, 0, Math.PI*2); octx.stroke();
   }
   if (gesture === 'FIST') {
     // bracket corners at the palm — freeze-frame marker
@@ -1152,6 +1191,12 @@ function frame(now) {
       orb.y += (my - orb.y) * 0.25;
       orb.z += (mz - orb.z) * 0.25;
 
+      // index fingertip in normalized screen space (mirrored to match the
+      // selfie view) — this is the cursor for colour picking
+      idxTip.x = 1 - lm[8].x;
+      idxTip.y = lm[8].y;
+      idxTip.has = true;
+
       // debounced state switch — per-gesture frame requirement
       const g = classify(lm);
       if (g === gesture) { pendingFrames = 0; }
@@ -1207,22 +1252,42 @@ function frame(now) {
     orbRadius += (ORB_RADIUS - orbRadius) * 0.06;
   }
 
-  // ── gesture colour picking: pinch + move to steer the palette.
-  // Reuses PINCH because it's the one gesture that's already a precise,
-  // deliberate pose — you're unlikely to trigger it by accident. Hue tracks
-  // horizontal hand position, brightness vertical.
-  if (gesturePick && gesture === 'PINCH' && handPresent) {
-    const nx = Math.max(-1, Math.min(1, handPos.x / (visW * 0.42)));  // -1..1
-    const ny = Math.max(-1, Math.min(1, handPos.y / (visH * 0.42)));
-    const targetHue = ((nx + 1) / 2) * 360;
-    const targetL   = 30 + ((ny + 1) / 2) * 45;
+  // ── gesture colour picking: thumb+middle pinch arms it, INDEX TIP aims.
+  // The fingertip is mapped into the wheel's own screen rect, so you are
+  // literally pointing at the colour you want rather than steering a value.
+  if (gesture === 'COLOR' && idxTip.has) {
+    const r = elWheel.getBoundingClientRect();
+    // fingertip -> viewport pixels
+    const px = idxTip.x * innerWidth;
+    const py = idxTip.y * innerHeight;
+    // -> wheel-local, centred
+    const dx = px - (r.left + r.width / 2);
+    const dy = py - (r.top  + r.height / 2);
+    const dist = Math.sqrt(dx*dx + dy*dy);
+    const radius = r.width / 2;
+
+    // Aim is amplified: the wheel is small on screen, so raw fingertip motion
+    // barely moves inside it. Scale distance from centre, keep the angle.
+    const AIM_GAIN = 2.6;
+    const scaled = Math.min(dist * AIM_GAIN, radius);
+    const norm = radius > 0 ? scaled / radius : 0;
+
+    const targetHue = (Math.atan2(dy, dx) * 180/Math.PI + 360) % 360;
+    // distance from centre -> brightness: centre = dim, rim = bright
+    const targetL = 32 + norm * 42;
+
     // shortest-path hue lerp so 350->10 doesn't spin the long way round
     let dh = targetHue - pal.hue;
     if (dh >  180) dh -= 360;
     if (dh < -180) dh += 360;
-    pal.hue   = ((pal.hue + dh * 0.12) % 360 + 360) % 360;
-    pal.light = pal.light + (targetL - pal.light) * 0.12;
+    pal.hue   = ((pal.hue + dh * 0.18) % 360 + 360) % 360;
+    pal.light = pal.light + (targetL - pal.light) * 0.18;
     applyPalette();
+    aim.x = r.left + r.width/2  + Math.cos(pal.hue*Math.PI/180) * norm * radius;
+    aim.y = r.top  + r.height/2 + Math.sin(pal.hue*Math.PI/180) * norm * radius;
+    aim.on = true;
+  } else {
+    aim.on = false;
   }
 
   step(dt, t);
@@ -1277,7 +1342,9 @@ function frame(now) {
       `ext i/m/r/p ${dbg.ext.map(v=>v.toFixed(2)).join(' ')}  (in>${TH.EXT_IN})\n` +
       `extended  ${dbg.count}   pinchState ${pinchState ? 'Y' : 'n'}\n` +
       `orb r ${orbRadius.toFixed(2)}  gap ${pinchGap.toFixed(2)}  ` +
-      `(map ${ORB_GAP_LO}-${ORB_GAP_HI} -> ${ORB_MIN}-${ORB_MAX})`;
+      `(map ${ORB_GAP_LO}-${ORB_GAP_HI} -> ${ORB_MIN}-${ORB_MAX})\n` +
+      `mid-pinch ${(dbg.midD||0).toFixed(2)} (in<${TH.MPINCH_IN})  ` +
+      `armed ${gesturePick ? 'Y' : 'n'}  mState ${mPinchState ? 'Y' : 'n'}`;
   }
 }
 
@@ -1294,7 +1361,8 @@ const elGpick   = document.getElementById('af-gpick');
 const wctx      = elWheel.getContext('2d');
 const WHEEL_R   = 90;
 
-let gesturePick = false;   // hand-driven hue selection
+// (gesturePick + aim are declared up with the other hand state, since the
+// frame loop reads them before this block is evaluated)
 
 // draw the hue wheel once — it never changes
 (function drawWheel() {
@@ -1329,6 +1397,19 @@ function drawMarker() {
   wctx.strokeStyle = '#fff'; wctx.lineWidth = 2.5; wctx.stroke();
   wctx.beginPath(); wctx.arc(x, y, 7, 0, Math.PI*2);
   wctx.strokeStyle = 'rgba(0,0,0,0.55)'; wctx.lineWidth = 1; wctx.stroke();
+
+  // live fingertip cursor while the colour gesture is held
+  if (aim.on) {
+    const rect = elWheel.getBoundingClientRect();
+    const ax = aim.x - rect.left, ay = aim.y - rect.top;
+    wctx.beginPath(); wctx.arc(ax, ay, 11, 0, Math.PI*2);
+    wctx.strokeStyle = 'rgba(255,255,255,0.95)'; wctx.lineWidth = 2; wctx.stroke();
+    wctx.beginPath(); wctx.moveTo(ax-15, ay); wctx.lineTo(ax-6, ay);
+    wctx.moveTo(ax+6, ay); wctx.lineTo(ax+15, ay);
+    wctx.moveTo(ax, ay-15); wctx.lineTo(ax, ay-6);
+    wctx.moveTo(ax, ay+6); wctx.lineTo(ax, ay+15);
+    wctx.strokeStyle = 'rgba(255,255,255,0.75)'; wctx.lineWidth = 1.5; wctx.stroke();
+  }
 }
 
 // keep the panel preview in sync — called from applyPalette()
@@ -1385,8 +1466,9 @@ elGpick.addEventListener('click', () => {
   gesturePick = !gesturePick;
   elGpick.textContent = gesturePick ? 'on' : 'off';
   elGpick.classList.toggle('active', gesturePick);
+  if (gesturePick) elPanel.classList.add('on');   // must be visible to aim at
   document.getElementById('af-panel-hint').textContent = gesturePick
-    ? 'pinch and move your hand LEFT/RIGHT to rotate the hue, UP/DOWN for brightness.'
+    ? 'touch THUMB + MIDDLE finger to arm, then point with your INDEX at the wheel. Index pinch still makes the orb.'
     : 'click the wheel to set a base colour — the gradient is generated from it.';
 });
 
