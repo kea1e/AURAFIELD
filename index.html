@@ -157,7 +157,12 @@ import { HandLandmarker, FilesetResolver }
 
 /* ─────────────────────────── config ─────────────────────────── */
 const COUNT       = 40000;
-const ORB_RADIUS  = 0.62;
+const ORB_RADIUS  = 0.62;   // base radius — pinch spread scales around this
+const ORB_MIN     = 0.22;   // tightest pinch
+const ORB_MAX     = 1.35;   // fingers spread wide
+const ORB_GAP_LO  = 0.10;   // measured thumb-index gap at a tight pinch
+const ORB_GAP_HI  = 0.85;   // ...and at a wide spread (still gated as pinch)
+const ORB_SMOOTH  = 0.18;   // radius lerp — raw gap is jittery
 const ORB_SPIN    = 0.55;   // rad/sec the sphere rotates while held
 const ORB_JITTER  = 0.09;   // shell thickness — 0 = glassy, higher = fuzzy
 const HAND_RADIUS = 1.5;    // falloff radius for open-hand advection
@@ -181,6 +186,10 @@ const TH = {
   EXT_OUT:     0.45,
   PINCH_IDX:   0.40,   // index must be out of the palm: fist 0.28, pinch 0.53
   PINCH_THUMB: 0.36,   // thumb likewise: fist 0.26, pinch 0.47
+  // Once pinching, the gap is allowed to open this wide before pinch is
+  // released — that headroom is what lets you SPREAD to grow the orb.
+  // Sits below a real open hand (measured 1.27) so opening still exits.
+  PINCH_HOLD:  0.98,
 };
 const TH_DEFAULTS = { ...TH };
 const Z_WEIGHT    = 0.5;    // MediaPipe z is noisy — count it, but at half weight
@@ -422,12 +431,16 @@ let pinchState = false;
 const burst = { t: 0, x: 0, y: 0, z: 0, power: 0 };
 let orbAngle = 0;   // sphere spin accumulator
 let frozen = false; // true while a fist is holding the field
+let pinchGap = 0;                 // live thumb-index gap while pinching
+let orbRadius = ORB_RADIUS;       // smoothed, driven by pinchGap
 
 function fireBurst(from) {
   // expand outward from wherever the particles were being held
   if (from === 'PINCH') {
     burst.x = orb.x; burst.y = orb.y; burst.z = orb.z;
-    burst.power = BURST_PINCH;
+    // a wide orb has its particles further out — scale the kick so a big
+    // sphere doesn't just gently sag when released
+    burst.power = BURST_PINCH * (0.7 + orbRadius / ORB_RADIUS * 0.5);
   } else {
     burst.x = handPos.x; burst.y = handPos.y; burst.z = handPos.z;
     burst.power = BURST_FIST;
@@ -680,9 +693,13 @@ function classify(lm) {
   const gateOK = idxOut   > TH.PINCH_IDX
               && thumbOut > TH.PINCH_THUMB
               && othersOut >= 2;
-  pinchState = gateOK && (pinchState ? (pinchD < TH.PINCH_OUT) : (pinchD < TH.PINCH_IN));
+  // Asymmetric exit: entering needs a tight gap (PINCH_IN), but once held the
+  // gap may open all the way to PINCH_HOLD. That headroom is what lets the
+  // user spread thumb+index to resize the orb without dropping the gesture.
+  const exitAt = pinchState ? TH.PINCH_HOLD : TH.PINCH_IN;
+  pinchState = gateOK && (pinchD < exitAt);
 
-  if (pinchState) return 'PINCH';
+  if (pinchState) { pinchGap = pinchD; return 'PINCH'; }
   if (extCount >= 3) return 'OPEN';
   if (extCount <= 1) return 'FIST';
   return gesture;   // 2 fingers: ambiguous, hold whatever we had
@@ -719,9 +736,11 @@ function drawSkeleton(lm) {
     octx.lineWidth = 3;
     octx.beginPath(); octx.moveTo(px(4),py(4)); octx.lineTo(px(8),py(8)); octx.stroke();
     const cx = (px(4)+px(8))/2, cy = (py(4)+py(8))/2;
+    // ring scales with the live orb radius so the gesture reads as a size dial
+    const rPx = 18 + (orbRadius - ORB_MIN) / (ORB_MAX - ORB_MIN) * 62;
     octx.strokeStyle = 'rgba(120,225,255,0.7)';
     octx.lineWidth = 2;
-    octx.beginPath(); octx.arc(cx, cy, 30, 0, Math.PI*2); octx.stroke();
+    octx.beginPath(); octx.arc(cx, cy, rPx, 0, Math.PI*2); octx.stroke();
   }
   if (gesture === 'FIST') {
     // bracket corners at the palm — freeze-frame marker
@@ -815,9 +834,9 @@ function step(dt, t) {
       // rotate the target around Y by orbAngle
       const tx = sx * orbCos - sz * orbSin;
       const tz = sx * orbSin + sz * orbCos;
-      const gx = orb.x + tx * ORB_RADIUS;
-      const gy = orb.y + sy * ORB_RADIUS;
-      const gz = orb.z + tz * ORB_RADIUS;
+      const gx = orb.x + tx * orbRadius;
+      const gy = orb.y + sy * orbRadius;
+      const gz = orb.z + tz * orbRadius;
       vx += (gx - px) * of * dt;
       vy += (gy - py) * of * dt;
       vz += (gz - pz) * of * dt;
@@ -984,13 +1003,24 @@ function frame(now) {
   }
   P.freeze = T.freeze;                 // instant, so the hold is exact
 
+  // ── pinch spread drives orb size. Only tracked while PINCH is the active
+  // gesture; any other state eases the radius back to its base so the next
+  // pinch starts from a neutral size.
+  if (gesture === 'PINCH') {
+    const norm = (pinchGap - ORB_GAP_LO) / (ORB_GAP_HI - ORB_GAP_LO);
+    const target = ORB_MIN + (ORB_MAX - ORB_MIN) * Math.max(0, Math.min(1, norm));
+    orbRadius += (target - orbRadius) * ORB_SMOOTH;
+  } else {
+    orbRadius += (ORB_RADIUS - orbRadius) * 0.06;
+  }
+
   step(dt, t);
 
   // orb colouring ramps in with the sphere force, so the palette shift
   // arrives as the ball forms rather than snapping on at the gesture switch
   mat.uniforms.uOrb.value = Math.min(P.orbForce / 26.0, 1.0);
   mat.uniforms.uOrbC.value.set(orb.x, orb.y, orb.z);
-  mat.uniforms.uOrbR.value = ORB_RADIUS;
+  mat.uniforms.uOrbR.value = orbRadius;
 
   // ── render: fade quad first, then additive points.
   // While frozen we skip the fade — otherwise the trail buffer would keep
@@ -1011,7 +1041,10 @@ function frame(now) {
     flashT -= dt;
     elDesc.textContent = flashMsg;
   } else {
-    elDesc.textContent = burst.t > 0 ? 'RELEASE — bursting outward' : DESC[gesture];
+    elDesc.textContent = burst.t > 0 ? 'RELEASE — bursting outward'
+      : (gesture === 'PINCH'
+          ? `orb — spread to resize (r ${orbRadius.toFixed(2)})`
+          : DESC[gesture]);
   }
 
   if (showDbg) {
@@ -1023,7 +1056,9 @@ function frame(now) {
       `index out ${mark(dbg.idx,   TH.PINCH_IDX)}  (gate >${TH.PINCH_IDX})\n` +
       `thumb out ${mark(dbg.thumb, TH.PINCH_THUMB)}  (gate >${TH.PINCH_THUMB})\n` +
       `ext i/m/r/p ${dbg.ext.map(v=>v.toFixed(2)).join(' ')}  (in>${TH.EXT_IN})\n` +
-      `extended  ${dbg.count}   pinchState ${pinchState ? 'Y' : 'n'}`;
+      `extended  ${dbg.count}   pinchState ${pinchState ? 'Y' : 'n'}\n` +
+      `orb r ${orbRadius.toFixed(2)}  gap ${pinchGap.toFixed(2)}  ` +
+      `(map ${ORB_GAP_LO}-${ORB_GAP_HI} -> ${ORB_MIN}-${ORB_MAX})`;
   }
 }
 
