@@ -7,11 +7,22 @@ Inspired by [nicholaspjm's TouchDesigner hand-tracked particle sim](https://www.
 ## Run
 
 ```bash
+AURA
+```
+
+That's it — the launcher finds a free port, waits for the server to actually
+answer, then opens Chrome. Also `aura stop`, `aura status`, `aura restart`.
+
+<details>
+<summary>Manual, without the alias</summary>
+
+```bash
 cd ~/projects/AURAFIELD
 python3 -m http.server 8777
 ```
 
 Open <http://localhost:8777> in Chrome and allow camera access.
+</details>
 
 **Must be served over HTTP.** `getUserMedia()` is blocked on `file://` URLs — double-clicking the HTML file will not work.
 

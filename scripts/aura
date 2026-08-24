@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# AURAFIELD launcher — hand-tracked particle field
+#
+# Designed to be demo-proof: never assumes a port is free, never assumes a
+# server is already up, never opens the browser before the page can answer.
+#
+#   aura          launch (reuses a healthy server if one is already running)
+#   aura stop     shut the server down
+#   aura status   report what's running
+#   aura restart  stop, then launch fresh
+
+set -uo pipefail
+
+PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PREFERRED_PORT=8777
+PORT_RANGE=20                       # ports to try before giving up
+STATE_DIR="$HOME/.aurafield"
+PID_FILE="$STATE_DIR/server.pid"
+PORT_FILE="$STATE_DIR/server.port"
+LOG_FILE="$STATE_DIR/server.log"
+
+mkdir -p "$STATE_DIR"
+
+c_dim=$'\033[2m'; c_cy=$'\033[36m'; c_gr=$'\033[32m'
+c_rd=$'\033[31m'; c_yl=$'\033[33m'; c_rs=$'\033[0m'
+
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '%s✓%s %s\n' "$c_gr" "$c_rs" "$*"; }
+warn() { printf '%s!%s %s\n' "$c_yl" "$c_rs" "$*"; }
+err()  { printf '%s✗%s %s\n' "$c_rd" "$c_rs" "$*" >&2; }
+
+# --- helpers ---------------------------------------------------------------
+
+port_in_use() { lsof -ti "tcp:$1" >/dev/null 2>&1; }
+
+# Is *our* app answering on this port? A port can be occupied by something
+# else entirely, so check the response body, not just the socket.
+#
+# NB: do NOT pipe curl into `grep -q`. grep -q exits on first match, curl
+# takes SIGPIPE and returns 23, and with `pipefail` that fails the whole
+# check even though the match succeeded. Capture first, then match.
+is_aurafield() {
+  local body
+  body="$(curl -fsS --max-time 2 "http://127.0.0.1:$1/index.html" 2>/dev/null)" || return 1
+  case "$body" in
+    *AURAFIELD*) return 0 ;;
+    *)           return 1 ;;
+  esac
+}
+
+find_free_port() {
+  local p=$PREFERRED_PORT
+  local limit=$((PREFERRED_PORT + PORT_RANGE))
+  while [ "$p" -lt "$limit" ]; do
+    port_in_use "$p" || { printf '%s' "$p"; return 0; }
+    p=$((p + 1))
+  done
+  return 1
+}
+
+running_port() {
+  [ -f "$PORT_FILE" ] || return 1
+  local p; p="$(cat "$PORT_FILE" 2>/dev/null)"
+  [ -n "$p" ] || return 1
+  is_aurafield "$p" || return 1
+  printf '%s' "$p"
+}
+
+pick_python() {
+  for c in python3 /opt/homebrew/bin/python3 /usr/bin/python3; do
+    command -v "$c" >/dev/null 2>&1 && { printf '%s' "$c"; return 0; }
+  done
+  return 1
+}
+
+open_browser() {
+  local url="$1"
+  # Chrome specifically — the app is developed and tested against it, and
+  # getUserMedia permissions are stored per-browser.
+  if open -a "Google Chrome" "$url" 2>/dev/null; then
+    ok "opened in Chrome"
+  elif open "$url" 2>/dev/null; then
+    warn "Chrome not found — opened in your default browser"
+  else
+    warn "couldn't open a browser automatically"
+    say "  visit: $c_cy$url$c_rs"
+  fi
+}
+
+# --- commands --------------------------------------------------------------
+
+do_stop() {
+  local stopped=0
+  if [ -f "$PID_FILE" ]; then
+    local pid; pid="$(cat "$PID_FILE" 2>/dev/null)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null && stopped=1
+      sleep 0.3
+      kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+    fi
+    rm -f "$PID_FILE"
+  fi
+  # sweep any stragglers serving this project
+  local leftovers
+  leftovers="$(pgrep -f "http.server .*$PREFERRED_PORT" 2>/dev/null || true)"
+  if [ -n "$leftovers" ]; then
+    printf '%s\n' "$leftovers" | xargs kill 2>/dev/null && stopped=1
+  fi
+  rm -f "$PORT_FILE"
+  [ "$stopped" -eq 1 ] && ok "AURAFIELD stopped" || say "${c_dim}nothing was running${c_rs}"
+}
+
+do_status() {
+  local p
+  if p="$(running_port)"; then
+    ok "running on http://localhost:$p"
+    [ -f "$PID_FILE" ] && say "${c_dim}  pid $(cat "$PID_FILE")  log $LOG_FILE${c_rs}"
+  else
+    say "${c_dim}not running${c_rs}"
+  fi
+}
+
+do_start() {
+  # 0. sanity: the app must actually be there
+  if [ ! -f "$PROJECT_DIR/index.html" ]; then
+    err "index.html not found in $PROJECT_DIR"
+    err "has the project moved? update the alias in ~/.zshrc"
+    return 1
+  fi
+
+  # 1. already up and healthy? just reopen it.
+  local existing
+  if existing="$(running_port)"; then
+    ok "already running on port $existing"
+    open_browser "http://localhost:$existing"
+    return 0
+  fi
+
+  # 2. stale state from a crash — clean it up quietly
+  [ -f "$PID_FILE" ] && rm -f "$PID_FILE" "$PORT_FILE"
+
+  # 3. python?
+  local py
+  if ! py="$(pick_python)"; then
+    err "python3 not found — needed to serve the page"
+    err "install it with:  brew install python3"
+    return 1
+  fi
+
+  # 4. free port
+  local port
+  if ! port="$(find_free_port)"; then
+    err "no free port in range $PREFERRED_PORT-$((PREFERRED_PORT + PORT_RANGE))"
+    err "something is occupying them all. try:  aura stop"
+    return 1
+  fi
+  [ "$port" != "$PREFERRED_PORT" ] && \
+    warn "port $PREFERRED_PORT busy — using $port instead"
+
+  # 5. launch
+  cd "$PROJECT_DIR" || { err "cannot enter $PROJECT_DIR"; return 1; }
+  : > "$LOG_FILE"
+  nohup "$py" -m http.server "$port" --bind 127.0.0.1 >>"$LOG_FILE" 2>&1 &
+  local pid=$!
+  printf '%s' "$pid" > "$PID_FILE"
+  printf '%s' "$port" > "$PORT_FILE"
+
+  # 6. WAIT for readiness — this is the step that stops the demo failing.
+  # Opening the browser before the server answers gives a connection error.
+  local tries=0
+  printf '%s' "${c_dim}starting"
+  while [ "$tries" -lt 50 ]; do          # up to ~5s
+    if is_aurafield "$port"; then
+      printf '%s\n' "$c_rs"
+      ok "AURAFIELD serving on http://localhost:$port"
+      open_browser "http://localhost:$port"
+      say ""
+      say "  ${c_cy}✋ open hand${c_rs}   particles follow your motion"
+      say "  ${c_cy}✊ fist${c_rs}        freeze frame"
+      say "  ${c_cy}🤏 pinch${c_rs}       orb — spread fingers to resize"
+      say ""
+      say "${c_dim}  allow camera access when Chrome asks${c_rs}"
+      say "${c_dim}  stop with:  aura stop${c_rs}"
+      return 0
+    fi
+    # did the server die on us?
+    if ! kill -0 "$pid" 2>/dev/null; then
+      printf '%s\n' "$c_rs"
+      err "server exited immediately"
+      [ -s "$LOG_FILE" ] && sed 's/^/    /' "$LOG_FILE" | tail -5
+      rm -f "$PID_FILE" "$PORT_FILE"
+      return 1
+    fi
+    printf '.'
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+
+  printf '%s\n' "$c_rs"
+  err "server did not become ready in 5s"
+  err "check the log:  $LOG_FILE"
+  return 1
+}
+
+# --- dispatch --------------------------------------------------------------
+
+case "${1:-start}" in
+  ""|start|up)   do_start ;;
+  stop|down)     do_stop ;;
+  status)        do_status ;;
+  restart)       do_stop; sleep 0.4; do_start ;;
+  -h|--help|help)
+    say "AURAFIELD — hand-tracked particle field"
+    say ""
+    say "  aura           launch and open in Chrome"
+    say "  aura stop      shut down the server"
+    say "  aura status    show what's running"
+    say "  aura restart   stop, then relaunch"
+    ;;
+  *)
+    err "unknown command: $1"
+    say "try: aura [start|stop|status|restart]"
+    exit 1 ;;
+esac
