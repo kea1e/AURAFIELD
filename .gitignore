@@ -17,3 +17,7 @@ secrets.*
 # local runtime state
 .aurafield/
 *.log
+
+# demo recordings — too large for git (GitHub hard-blocks >100MB)
+*.mov
+*.mp4
