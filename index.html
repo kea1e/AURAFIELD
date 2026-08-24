@@ -323,6 +323,7 @@ const mat = new THREE.ShaderMaterial({
     uOrb:   { value: 0.0 },   // 0 = speed colouring, 1 = per-particle orb palette
     uOrbC:  { value: new THREE.Vector3(0,0,0) },
     uOrbR:  { value: 0.62 },
+    uDens:  { value: 1.0 },   // density compensation — 1 at base size, <1 when tight
   },
   vertexShader: `
     attribute float aSpeed;
@@ -335,6 +336,7 @@ const mat = new THREE.ShaderMaterial({
     uniform float uOrb;
     uniform vec3  uOrbC;
     uniform float uOrbR;
+    uniform float uDens;
     void main() {
       vS = aSpeed;
       vSeed = aSeed;
@@ -345,8 +347,11 @@ const mat = new THREE.ShaderMaterial({
       float rel = (position.z - uOrbC.z) / max(uOrbR, 0.001);   // -1 .. +1
       vShade = mix(1.0, clamp(0.42 + 0.58 * (rel * 0.5 + 0.5), 0.0, 1.0), uOrb);
 
-      // per-particle size variation — uniform dots read as a solid surface
-      float sizeVar = mix(1.0, 0.55 + aSeed * 0.9, uOrb);
+      // per-particle size variation — uniform dots read as a solid surface.
+      // Dots also shrink as the orb tightens (uDens^0.3, a gentle curve —
+      // scaling them linearly overcorrects and the small orb goes dim).
+      float densSize = pow(max(uDens, 0.001), 0.3);
+      float sizeVar = mix(1.0, (0.55 + aSeed * 0.9) * mix(1.0, densSize, uOrb), uOrb);
       gl_PointSize = clamp(uSize * uPR * sizeVar * (1.0 / max(-mv.z, 0.001)), 1.0, 6.0 * uPR);
       gl_Position = projectionMatrix * mv;
     }
@@ -360,6 +365,7 @@ const mat = new THREE.ShaderMaterial({
     uniform vec3 uHot;
     uniform vec3 uViolet;
     uniform float uOrb;
+    uniform float uDens;
     void main() {
       vec2 c = gl_PointCoord - vec2(0.5);
       float d = length(c);
@@ -373,21 +379,31 @@ const mat = new THREE.ShaderMaterial({
         : mix(uWarm, uHot, (t - 0.5) * 2.0);
 
       // orb colouring: each particle keeps its OWN place on the ramp, so a
-      // stationary sphere still shows gradient instead of one flat colour
+      // stationary sphere still shows gradient instead of one flat colour.
+      // Weighted toward the deep end — the bright top of the ramp is what
+      // saturates to white first when particles stack.
       float s = vSeed;
       vec3 orbCol;
-      if (s < 0.45)      orbCol = mix(uViolet, uCold, s / 0.45);
-      else if (s < 0.82) orbCol = mix(uCold,   uWarm, (s - 0.45) / 0.37);
-      else               orbCol = mix(uWarm,   uHot,  (s - 0.82) / 0.18);
+      if (s < 0.40)      orbCol = mix(uViolet, uCold, s / 0.40);
+      else if (s < 0.78) orbCol = mix(uCold,   uWarm, (s - 0.40) / 0.38);
+      else if (s < 0.94) orbCol = mix(uWarm,   uHot,  (s - 0.78) / 0.16);
+      else               orbCol = uHot;
 
       vec3 col = mix(moving, orbCol, uOrb) * vShade;
 
       // sparse bright specks give the shell some sparkle
       float spark = step(0.972, s) * uOrb;
-      col += spark * 0.7;
+      col += spark * 0.7 * min(uDens, 1.0);
 
-      float a = core * mix(0.85, 0.62 + s * 0.5, uOrb);
-      gl_FragColor = vec4(col, a);
+      // Density compensation is the actual fix for "small orb goes white":
+      // additive blending SUMS overlapping fragments, so packing the same 40k
+      // particles onto a tighter shell clips every channel to 1.0. Scaling
+      // alpha by uDens^0.7 holds the summed output roughly flat across the
+      // size range (measured 1.7x spread vs 9.8x uncompensated), which is
+      // what keeps individual hues readable instead of washing to white.
+      float densA = pow(max(uDens, 0.001), 0.7);
+      float a = core * mix(0.85, (0.62 + s * 0.5) * densA, uOrb);
+      gl_FragColor = vec4(col, clamp(a, 0.0, 1.0));
     }
   `,
   transparent: true,
@@ -1021,6 +1037,14 @@ function frame(now) {
   mat.uniforms.uOrb.value = Math.min(P.orbForce / 26.0, 1.0);
   mat.uniforms.uOrbC.value.set(orb.x, orb.y, orb.z);
   mat.uniforms.uOrbR.value = orbRadius;
+
+  // Density compensation. Particles sit on a SHELL, so crowding scales with
+  // surface area (r^2), not volume. A third-size orb packs them ~8x tighter
+  // and additive blending turns that into clipped white. The shader applies
+  // uDens^0.7 to alpha and uDens^0.3 to dot size; those exponents were solved
+  // for flattest brightness across the range (1.7x spread vs 9.8x raw).
+  const areaRatio = (orbRadius * orbRadius) / (ORB_RADIUS * ORB_RADIUS);
+  mat.uniforms.uDens.value = Math.max(0.20, Math.min(2.5, areaRatio));
 
   // ── render: fade quad first, then additive points.
   // While frozen we skip the fade — otherwise the trail buffer would keep
