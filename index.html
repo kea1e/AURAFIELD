@@ -102,6 +102,77 @@
   #af-cal-skip {
     margin-top:20px; font-size:10px; color:#3d5c70; letter-spacing:0.06em;
   }
+
+  /* ── settings / palette panel ── */
+  #af-panel {
+    position:fixed; right:18px; top:18px; z-index:7; display:none;
+    width:268px; padding:18px; border-radius:12px;
+    background:rgba(6,14,24,0.94);
+    border:1px solid rgba(143,216,255,0.22);
+    box-shadow:0 14px 50px rgba(0,0,0,0.75);
+    backdrop-filter:blur(6px);
+    user-select:none;
+  }
+  #af-panel.on { display:block; }
+  #af-panel h2 {
+    font-size:10.5px; letter-spacing:0.3em; color:#8fd8ff;
+    font-weight:600; margin-bottom:14px;
+  }
+  #af-wheel {
+    display:block; margin:0 auto; cursor:crosshair; border-radius:50%;
+    box-shadow:0 0 0 1px rgba(143,216,255,0.18);
+  }
+  .af-lbl {
+    display:flex; justify-content:space-between; align-items:baseline;
+    font-size:10px; color:#5e8aa8; letter-spacing:0.06em;
+    margin:14px 0 5px;
+  }
+  .af-lbl b { color:#bfeaff; font-weight:600; font-size:10.5px; }
+  #af-panel input[type=range] {
+    width:100%; height:3px; -webkit-appearance:none; appearance:none;
+    background:rgba(143,216,255,0.16); border-radius:2px; outline:none;
+  }
+  #af-panel input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance:none; appearance:none;
+    width:12px; height:12px; border-radius:50%;
+    background:#27d8ff; cursor:pointer;
+    box-shadow:0 0 8px rgba(39,216,255,0.8);
+  }
+  #af-ramp {
+    height:16px; border-radius:4px; margin-top:14px;
+    border:1px solid rgba(143,216,255,0.16);
+  }
+  #af-swatches { display:flex; gap:5px; margin-top:6px; }
+  .af-sw {
+    flex:1; height:9px; border-radius:2px;
+    border:1px solid rgba(255,255,255,0.10);
+  }
+  #af-presets { display:flex; flex-wrap:wrap; gap:5px; margin-top:14px; }
+  .af-preset {
+    width:22px; height:22px; border-radius:50%; cursor:pointer;
+    border:1px solid rgba(255,255,255,0.18);
+    transition:transform 0.12s ease;
+  }
+  .af-preset:hover { transform:scale(1.18); }
+  #af-panel .af-row {
+    display:flex; align-items:center; justify-content:space-between;
+    margin-top:14px; font-size:10.5px; color:#5e8aa8; letter-spacing:0.05em;
+  }
+  .af-btn {
+    background:rgba(143,216,255,0.10);
+    border:1px solid rgba(143,216,255,0.24);
+    color:#9fd6f0; border-radius:5px; padding:5px 10px;
+    font-family:inherit; font-size:10px; cursor:pointer;
+    letter-spacing:0.06em; transition:background 0.12s ease;
+  }
+  .af-btn:hover { background:rgba(143,216,255,0.20); }
+  .af-btn.active {
+    background:rgba(39,216,255,0.26); color:#dff4ff;
+    border-color:rgba(39,216,255,0.6);
+  }
+  #af-panel .af-hint {
+    margin-top:12px; font-size:9.5px; color:#3d5c70; line-height:1.6;
+  }
 </style>
 </head>
 <body>
@@ -122,8 +193,43 @@
 
 <div id="af-keys">
   <kbd>H</kbd> hud &nbsp; <kbd>V</kbd> camera &nbsp; <kbd>S</kbd> skeleton &nbsp;
-  <kbd>D</kbd> debug &nbsp; <kbd>R</kbd> reset &nbsp; <kbd>Space</kbd> pause<br>
+  <kbd>P</kbd> colour &nbsp; <kbd>D</kbd> debug &nbsp; <kbd>R</kbd> reset &nbsp;
+  <kbd>Space</kbd> pause<br>
   <kbd>C</kbd> recalibrate &nbsp; <kbd>X</kbd> reset calibration
+</div>
+
+<div id="af-panel">
+  <h2>PARTICLE COLOUR</h2>
+  <canvas id="af-wheel" width="180" height="180"></canvas>
+
+  <div class="af-lbl"><span>spread</span><b id="af-spread-v">35°</b></div>
+  <input type="range" id="af-spread" min="8" max="90" value="35">
+
+  <div class="af-lbl"><span>brightness</span><b id="af-light-v">57%</b></div>
+  <input type="range" id="af-light" min="25" max="80" value="57">
+
+  <div id="af-ramp"></div>
+  <div id="af-swatches">
+    <div class="af-sw" id="af-sw0"></div>
+    <div class="af-sw" id="af-sw1"></div>
+    <div class="af-sw" id="af-sw2"></div>
+    <div class="af-sw" id="af-sw3"></div>
+  </div>
+
+  <div id="af-presets"></div>
+
+  <div class="af-row">
+    <span>pick with hand</span>
+    <button class="af-btn" id="af-gpick">off</button>
+  </div>
+  <div class="af-row">
+    <span></span>
+    <button class="af-btn" id="af-reset-pal">reset</button>
+  </div>
+
+  <div class="af-hint" id="af-panel-hint">
+    click the wheel to set a base colour — the gradient is generated from it.
+  </div>
 </div>
 
 <div id="af-cal">
@@ -606,6 +712,77 @@ function calLoad() {
 window.AF_TH = TH;
 window.AF_RECAL = calStart;
 
+// ── palette ─────────────────────────────────────────────────────
+// One base hue drives the whole ramp. The four shader colours are derived
+// as an analogous spread around it: deep/dark at the low end climbing to a
+// near-white hot tip, which is what keeps the speed ramp and the orb's
+// per-particle gradient both readable.
+const PAL_KEY = 'aurafield.palette.v1';
+const PAL_DEFAULT = { hue: 225, spread: 35, light: 57 };
+const pal = { ...PAL_DEFAULT };
+
+function hsl2rgb(h, s, l) {
+  h = ((h % 360) + 360) % 360; s /= 100; l /= 100;
+  const c = (1 - Math.abs(2*l - 1)) * s;
+  const x = c * (1 - Math.abs(((h/60) % 2) - 1));
+  const m = l - c/2;
+  let r=0, g=0, b=0;
+  if      (h <  60) { r=c; g=x; }
+  else if (h < 120) { r=x; g=c; }
+  else if (h < 180) { g=c; b=x; }
+  else if (h < 240) { g=x; b=c; }
+  else if (h < 300) { r=x; b=c; }
+  else              { r=c; b=x; }
+  return [r+m, g+m, b+m];
+}
+
+function hslCss(h, s, l) {
+  const [r,g,b] = hsl2rgb(h,s,l);
+  return `rgb(${Math.round(r*255)},${Math.round(g*255)},${Math.round(b*255)})`;
+}
+
+// Derive the 4 ramp stops. Returns CSS strings too, for the panel preview.
+function buildPalette() {
+  const h = pal.hue, sp = pal.spread, L = pal.light;
+  const stops = [
+    { h: h - sp,       s: 72, l: Math.max(14, L - 34) },  // deep  (uViolet)
+    { h: h,            s: 78, l: Math.max(20, L - 18) },  // base  (uCold)
+    { h: h + sp * 0.7, s: 88, l: Math.min(72, L + 12) },  // bright(uWarm)
+    { h: h + sp,       s: 40, l: Math.min(96, L + 38) },  // hot   (uHot)
+  ];
+  return {
+    rgb: stops.map(s => hsl2rgb(s.h, s.s, s.l)),
+    css: stops.map(s => hslCss(s.h, s.s, s.l)),
+  };
+}
+
+let palSaveT = 0;
+function applyPalette(persist = true) {
+  const p = buildPalette();
+  const set = (u, i) => mat.uniforms[u].value.setRGB(p.rgb[i][0], p.rgb[i][1], p.rgb[i][2]);
+  set('uViolet', 0); set('uCold', 1); set('uWarm', 2); set('uHot', 3);
+  if (typeof paintPanel === 'function') paintPanel(p);
+  // gesture picking calls this every frame — debounce the write so we aren't
+  // hammering localStorage 100x/sec
+  if (persist) {
+    clearTimeout(palSaveT);
+    palSaveT = setTimeout(() => {
+      try { localStorage.setItem(PAL_KEY, JSON.stringify(pal)); } catch (e) {}
+    }, 400);
+  }
+}
+
+function loadPalette() {
+  try {
+    const raw = localStorage.getItem(PAL_KEY);
+    if (!raw) return;
+    const s = JSON.parse(raw);
+    for (const k in PAL_DEFAULT) if (typeof s[k] === 'number') pal[k] = s[k];
+  } catch (e) {}
+}
+
+window.AF_PAL = pal;
+
 // ── rolling diagnostic buffer ────────────────────────────────────
 // Keeps the last ~8s of classifier metrics so a session can be inspected
 // after the fact instead of hoping to catch the right frame in a poll.
@@ -1030,6 +1207,24 @@ function frame(now) {
     orbRadius += (ORB_RADIUS - orbRadius) * 0.06;
   }
 
+  // ── gesture colour picking: pinch + move to steer the palette.
+  // Reuses PINCH because it's the one gesture that's already a precise,
+  // deliberate pose — you're unlikely to trigger it by accident. Hue tracks
+  // horizontal hand position, brightness vertical.
+  if (gesturePick && gesture === 'PINCH' && handPresent) {
+    const nx = Math.max(-1, Math.min(1, handPos.x / (visW * 0.42)));  // -1..1
+    const ny = Math.max(-1, Math.min(1, handPos.y / (visH * 0.42)));
+    const targetHue = ((nx + 1) / 2) * 360;
+    const targetL   = 30 + ((ny + 1) / 2) * 45;
+    // shortest-path hue lerp so 350->10 doesn't spin the long way round
+    let dh = targetHue - pal.hue;
+    if (dh >  180) dh -= 360;
+    if (dh < -180) dh += 360;
+    pal.hue   = ((pal.hue + dh * 0.12) % 360 + 360) % 360;
+    pal.light = pal.light + (targetL - pal.light) * 0.12;
+    applyPalette();
+  }
+
   step(dt, t);
 
   // orb colouring ramps in with the sphere force, so the palette shift
@@ -1086,6 +1281,121 @@ function frame(now) {
   }
 }
 
+/* ─────────────────────────── settings panel ─────────────────────────── */
+const elPanel   = document.getElementById('af-panel');
+const elWheel   = document.getElementById('af-wheel');
+const elSpread  = document.getElementById('af-spread');
+const elLight   = document.getElementById('af-light');
+const elSpreadV = document.getElementById('af-spread-v');
+const elLightV  = document.getElementById('af-light-v');
+const elRamp    = document.getElementById('af-ramp');
+const elPresets = document.getElementById('af-presets');
+const elGpick   = document.getElementById('af-gpick');
+const wctx      = elWheel.getContext('2d');
+const WHEEL_R   = 90;
+
+let gesturePick = false;   // hand-driven hue selection
+
+// draw the hue wheel once — it never changes
+(function drawWheel() {
+  const img = wctx.createImageData(180, 180);
+  for (let y = 0; y < 180; y++) {
+    for (let x = 0; x < 180; x++) {
+      const dx = x - WHEEL_R, dy = y - WHEEL_R;
+      const r = Math.sqrt(dx*dx + dy*dy);
+      const i = (y*180 + x) * 4;
+      if (r > WHEEL_R) { img.data[i+3] = 0; continue; }
+      const hue = (Math.atan2(dy, dx) * 180/Math.PI + 360) % 360;
+      const sat = Math.min(100, (r / WHEEL_R) * 100);
+      const [cr,cg,cb] = hsl2rgb(hue, sat, 55);
+      img.data[i]   = cr*255;
+      img.data[i+1] = cg*255;
+      img.data[i+2] = cb*255;
+      // feather the rim so it doesn't alias
+      img.data[i+3] = r > WHEEL_R - 1.5 ? 255 * (WHEEL_R - r) / 1.5 : 255;
+    }
+  }
+  wctx.putImageData(img, 0, 0);
+})();
+
+// marker showing the current hue, redrawn over a cached wheel
+const wheelImg = wctx.getImageData(0, 0, 180, 180);
+function drawMarker() {
+  wctx.putImageData(wheelImg, 0, 0);
+  const a = pal.hue * Math.PI/180;
+  const r = WHEEL_R * 0.78;
+  const x = WHEEL_R + Math.cos(a)*r, y = WHEEL_R + Math.sin(a)*r;
+  wctx.beginPath(); wctx.arc(x, y, 7, 0, Math.PI*2);
+  wctx.strokeStyle = '#fff'; wctx.lineWidth = 2.5; wctx.stroke();
+  wctx.beginPath(); wctx.arc(x, y, 7, 0, Math.PI*2);
+  wctx.strokeStyle = 'rgba(0,0,0,0.55)'; wctx.lineWidth = 1; wctx.stroke();
+}
+
+// keep the panel preview in sync — called from applyPalette()
+function paintPanel(p) {
+  elRamp.style.background =
+    `linear-gradient(90deg, ${p.css[0]}, ${p.css[1]}, ${p.css[2]}, ${p.css[3]})`;
+  for (let i = 0; i < 4; i++) {
+    document.getElementById('af-sw' + i).style.background = p.css[i];
+  }
+  elSpreadV.textContent = `${pal.spread}°`;
+  elLightV.textContent  = `${pal.light}%`;
+  elSpread.value = pal.spread;
+  elLight.value  = pal.light;
+  drawMarker();
+}
+
+function setHue(h) {
+  pal.hue = ((h % 360) + 360) % 360;
+  applyPalette();
+}
+
+// wheel click / drag
+let wheelDrag = false;
+function wheelPick(ev) {
+  const r = elWheel.getBoundingClientRect();
+  const dx = (ev.clientX - r.left) - WHEEL_R;
+  const dy = (ev.clientY - r.top)  - WHEEL_R;
+  if (Math.sqrt(dx*dx + dy*dy) > WHEEL_R + 6) return;
+  setHue(Math.atan2(dy, dx) * 180/Math.PI);
+}
+elWheel.addEventListener('pointerdown', e => { wheelDrag = true; wheelPick(e); });
+addEventListener('pointermove', e => { if (wheelDrag) wheelPick(e); });
+addEventListener('pointerup',   () => { wheelDrag = false; });
+
+elSpread.addEventListener('input', e => { pal.spread = +e.target.value; applyPalette(); });
+elLight .addEventListener('input', e => { pal.light  = +e.target.value; applyPalette(); });
+
+// presets — hue values, gradient still auto-generated from each
+const PRESETS = [
+  { n:'aurora',  h:225 }, { n:'ember',  h:18  }, { n:'toxic',  h:96  },
+  { n:'magenta', h:310 }, { n:'gold',   h:44  }, { n:'ice',    h:190 },
+  { n:'blood',   h:352 }, { n:'violet', h:270 },
+];
+PRESETS.forEach(p => {
+  const b = document.createElement('div');
+  b.className = 'af-preset';
+  b.title = p.n;
+  b.style.background = hslCss(p.h, 80, 55);
+  b.addEventListener('click', () => setHue(p.h));
+  elPresets.appendChild(b);
+});
+
+elGpick.addEventListener('click', () => {
+  gesturePick = !gesturePick;
+  elGpick.textContent = gesturePick ? 'on' : 'off';
+  elGpick.classList.toggle('active', gesturePick);
+  document.getElementById('af-panel-hint').textContent = gesturePick
+    ? 'pinch and move your hand LEFT/RIGHT to rotate the hue, UP/DOWN for brightness.'
+    : 'click the wheel to set a base colour — the gradient is generated from it.';
+});
+
+document.getElementById('af-reset-pal').addEventListener('click', () => {
+  Object.assign(pal, PAL_DEFAULT);
+  applyPalette();
+  flashMsg = 'palette reset'; flashT = 1.5;
+});
+
 /* ─────────────────────────── events ─────────────────────────── */
 function resize() {
   const w = innerWidth, h = innerHeight;
@@ -1105,6 +1415,7 @@ addEventListener('keydown', e => {
   if (k === 's') { showSkeleton = !showSkeleton; octx.clearRect(0,0,overlay.width,overlay.height); }
   if (k === 'r') seed();
   if (k === 'd') { showDbg = !showDbg; elDbg.classList.toggle('on', showDbg); }
+  if (k === 'p') { elPanel.classList.toggle('on'); }
   if (k === 'c') calStart();
   if (k === 'x') {
     for (const key in TH_DEFAULTS) TH[key] = TH_DEFAULTS[key];
@@ -1130,6 +1441,8 @@ addEventListener('keydown', e => {
     // defaults are measured from real hand data, so calibration is now an
     // opt-in refinement (press C) rather than a forced first-run gate
     calLoad();
+    loadPalette();
+    applyPalette(false);
     requestAnimationFrame(frame);
   } catch (err) {
     console.error(err);
