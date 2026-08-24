@@ -300,39 +300,80 @@ const DISK_ARC_J  = 0.16;   // +/- radial spread of the ring (fraction of R)
 const HAND_RADIUS = 1.5;    // falloff radius for open-hand advection
 const FADE        = 0.16;   // trail persistence (lower = longer trails)
 
-// gesture thresholds — DEFAULTS, derived from REAL measured hand data
-// (see AF_STATS capture 2026-08-24). Calibration can refine these per-user,
-// but these numbers already work standalone.
+// ── lightning bolt (rock sign) ──
+// Built by recursive midpoint displacement: take a segment, kick its midpoint
+// sideways, recurse. That is the standard way to get a jagged channel that
+// looks electrical rather than like a random walk.
+const BOLT_SEGS   = 5;      // recursion depth -> 2^5 = 32 segments per branch
+const BOLT_LEN    = 2.7;    // height of the main channel
+const BOLT_AMP    = 0.62;   // initial lateral displacement
+const BOLT_BRANCH = 6;      // forks off the main channel
+const BOLT_MAX    = 640;    // point buffer ceiling
+const BOLT_SPIN   = 0.95;   // rad/sec around its own axis
+const BOLT_TUMBLE = 0.42;   // secondary tumble, radians
+const BOLT_TUM_S  = 0.7;    // tumble rate
+const BOLT_PULL   = 26.0;   // spring onto the channel
+const BOLT_JIT    = 0.06;   // scatter around the channel
+const BOLT_LIFE   = 0.62;   // seconds between re-strikes
+
+// ── GESTURE THRESHOLDS ────────────────────────────────────────────────
+// All distances are normalized by scale = 3D dist(wrist, middle_MCP), a rigid
+// bone, so they hold at any hand size or camera distance.
 //
-//   measured, open hand : ext/finger ~1.07  idx 1.14  thumb 0.80  pinchGap 1.27
-//   measured, fist      : ext/finger ~0.16  idx 0.28  thumb 0.26  pinchGap 0.26
-//   measured, pinch     : ext/finger ~0.91  idx 0.53  thumb 0.47  pinchGap 0.15
+// Measured from a real hand (480 frames, 2026-08-24). Extension is fingertip
+// distance from the palm centre; gap is thumb-tip to fingertip.
 //
-// The open/fist separation is enormous (1.07 vs 0.16), so EXT sits between.
-// Pinch is the subtle one: its INDEX curls in (0.53) while middle/ring/pinky
-// stay out — which is exactly how it differs from both fist and open hand.
+//                  index  middle   ring   pinky  | thumb-index gap
+//   open hand       1.14    1.23   1.06    0.89  |      1.27
+//   fist            0.28    0.12   0.05    0.18  |      0.26
+//   index pinch     0.53    1.13   1.06    0.86  |      0.15
+//
+// CONVENTION: _IN is the bar to ENTER a state, _OUT the bar to LEAVE it.
+// Every threshold that gates a sustained gesture has both. A single bar sat
+// at the noise floor makes the gesture chatter on and off; the gap between
+// IN and OUT is what stops that.
 const TH = {
-  PINCH_IN:    0.30,   // thumb-index gap: pinch measures 0.15, fist 0.26
-  PINCH_OUT:   0.45,
-  EXT_IN:      0.62,   // finger extended: fist ~0.16, open ~1.07
-  EXT_OUT:     0.45,
-  PINCH_IDX:   0.40,   // index must be out of the palm: fist 0.28, pinch 0.53
-  PINCH_THUMB: 0.36,   // thumb likewise: fist 0.26, pinch 0.47
-  // Once pinching, the gap is allowed to open this wide before pinch is
-  // released — that headroom is what lets you SPREAD to grow the orb.
-  // Sits below a real open hand (measured 1.27) so opening still exits.
-  PINCH_HOLD:  0.98,
-  // MIDDLE + thumb pinch = colour picking. Deliberately a different pair from
-  // the orb gesture so the two can never fight: an index pinch curls the index
-  // IN, this one leaves it extended to act as the pointer.
-  MPINCH_IN:   0.34,   // thumb <-> middle tip gap to enter
-  MPINCH_OUT:  0.52,   // ...and to leave (hysteresis)
-  POINT_IDX:   1.05,   // index clearly extended for the accretion disk
+  // ── finger extension — shared by every gesture ──
+  EXT_IN:        0.62,   // extended above this      (fist 0.16, open 1.07)
+  EXT_OUT:       0.45,   // stays extended until below this
+
+  // ── PINCH: thumb + index -> orb ──
+  PINCH_IN:      0.30,   // thumb-index gap to enter (pinch 0.15, fist 0.26)
+  PINCH_HOLD:    0.98,   // may open this wide before releasing — the headroom
+                         // is what lets you spread to resize the orb.
+                         // Below a real open hand (1.27) so opening still exits.
+  PINCH_IDX:     0.40,   // index must reach out of the palm (fist 0.28)
+  PINCH_THUMB:   0.36,   // thumb likewise                   (fist 0.26)
+
+  // ── COLOR: thumb + middle -> palette orb ──
+  // A different finger pair from PINCH so the two can never fight.
+  COLOR_IN:      0.34,   // thumb-middle gap to enter
+  COLOR_OUT:     0.52,   // ...and to leave
+  COLOR_RATIO:   0.85,   // middle must be at least this much closer to the
+                         // thumb than the index is. The one comparison that
+                         // stays robust when neighbouring fingers co-curl.
+
+  // ── POINT: index alone -> accretion disk ──
+  POINT_IN:      1.05,   // index extension to enter
+  POINT_OUT:     0.88,   // ...and to leave
+
+  // ── BOLT: index + pinky (rock sign) -> lightning ──
+  // The pinky is the weakest finger and routinely under-extends on a rock
+  // sign, so it gets a much lower bar than EXT_IN. Safe because BOLT also
+  // demands the index be clearly out and middle+ring clearly curled — a
+  // combination a fist cannot reach (3.0x margin on index, 2.3x on pinky).
+  BOLT_IDX:      0.85,   // index genuinely out       (fist 0.28)
+  BOLT_PINKY_IN: 0.42,   // pinky raised enough       (fist 0.18)
+  BOLT_PINKY_OUT:0.33,   // ...and released below this
+  BOLT_CURL:     0.55,   // middle + ring must be under this
 };
 const TH_DEFAULTS = { ...TH };
 const Z_WEIGHT    = 0.5;    // MediaPipe z is noisy — count it, but at half weight
-const DEBOUNCE    = { PINCH: 3, OPEN: 3, FIST: 4, IDLE: 4 };
-const CAL_KEY     = 'aurafield.calibration.v2';   // v1 held bad auto-test data
+// Frames a new gesture must persist before it commits. Higher = steadier
+// but laggier. IDLE/FIST are highest because a hand leaving frame or
+// briefly occluding shouldn't dump you out of an active gesture.
+const DEBOUNCE    = { PINCH: 3, COLOR: 3, POINT: 3, BOLT: 3, OPEN: 3, FIST: 4, IDLE: 4 };
+const CAL_KEY     = 'aurafield.calibration.v3';   // v1 held bad auto-test data
 
 // release burst — fires on PINCH/FIST -> OPEN
 const BURST_TIME  = 0.45;   // seconds the shockwave lasts
@@ -343,14 +384,16 @@ const BURST_R     = 1.1;    // falloff radius of the shockwave
 // per-gesture force parameters — these get LERPED, never hard-switched.
 // `freeze` is the exception: it's a hard boolean, not a lerped force.
 const PARAMS = {
-  IDLE:  { damping:0.985, handForce:0.0, orbForce:0.0,  diskForce:0.0, noise:0.35, homePull:0.30, freeze:0 },
-  OPEN:  { damping:0.960, handForce:9.0, orbForce:0.0,  diskForce:0.0, noise:0.55, homePull:0.00, freeze:0 },
-  FIST:  { damping:0.900, handForce:0.0, orbForce:0.0,  diskForce:0.0, noise:0.00, homePull:0.00, freeze:1 },
-  PINCH: { damping:0.880, handForce:0.0, orbForce:26.0, diskForce:0.0, noise:0.00, homePull:0.00, freeze:0 },
+  IDLE:  { damping:0.985, handForce:0.0, orbForce:0.0,  diskForce:0.0, boltForce:0.0, noise:0.35, homePull:0.30, freeze:0 },
+  OPEN:  { damping:0.960, handForce:9.0, orbForce:0.0,  diskForce:0.0, boltForce:0.0, noise:0.55, homePull:0.00, freeze:0 },
+  FIST:  { damping:0.900, handForce:0.0, orbForce:0.0,  diskForce:0.0, boltForce:0.0, noise:0.00, homePull:0.00, freeze:1 },
+  PINCH: { damping:0.880, handForce:0.0, orbForce:26.0, diskForce:0.0, boltForce:0.0, noise:0.00, homePull:0.00, freeze:0 },
   // palette: gathered sphere anchored where it formed, at a fixed size
-  COLOR: { damping:0.880, handForce:0.0, orbForce:26.0, diskForce:0.0, noise:0.00, homePull:0.00, freeze:0 },
+  COLOR: { damping:0.880, handForce:0.0, orbForce:26.0, diskForce:0.0, boltForce:0.0, noise:0.00, homePull:0.00, freeze:0 },
   // accretion disk at the index fingertip
-  POINT: { damping:0.930, handForce:0.0, orbForce:0.0,  diskForce:1.0, noise:0.05, homePull:0.00, freeze:0 },
+  POINT: { damping:0.930, handForce:0.0, orbForce:0.0,  diskForce:1.0, boltForce:0.0, noise:0.05, homePull:0.00, freeze:0 },
+  // rock sign -> 3D lightning bolt
+  BOLT:  { damping:0.860, handForce:0.0, orbForce:0.0,  diskForce:0.0, boltForce:1.0, noise:0.10, homePull:0.00, freeze:0 },
 };
 const DESC = {
   IDLE:  'waiting for a hand',
@@ -359,6 +402,7 @@ const DESC = {
   PINCH: 'gathered into a sphere',
   COLOR: 'palette — move the pinch to pick',
   POINT: 'accretion disk',
+  BOLT:  'lightning',
 };
 
 /* ─────────────────────────── dom ─────────────────────────── */
@@ -470,6 +514,66 @@ for (let i = 0; i < COUNT; i++) {
     const w = Math.random();
     diskR[i] = Math.sqrt(lo*lo + w * (hi*hi - lo*lo));
   }
+}
+
+// ── lightning bolt geometry ──
+// boltPts holds the current channel; it is REGENERATED every BOLT_LIFE
+// seconds, and that sudden reshape is what reads as a strike. Particles keep
+// a fixed parametric position (boltT) so they slide to the new shape rather
+// than teleporting randomly.
+const boltPts = new Float32Array(BOLT_MAX * 3);
+let boltN = 0;
+
+function boltPush(x, y, z) {
+  if (boltN >= BOLT_MAX) return;
+  boltPts[boltN*3] = x; boltPts[boltN*3+1] = y; boltPts[boltN*3+2] = z;
+  boltN++;
+}
+
+// recursive midpoint displacement — the classic lightning algorithm
+function boltDisplace(ax, ay, az, bx, by, bz, depth, amp) {
+  if (depth === 0 || boltN >= BOLT_MAX) { boltPush(bx, by, bz); return; }
+  const mx = (ax+bx)*0.5 + (Math.random()-0.5)*amp;
+  const my = (ay+by)*0.5 + (Math.random()-0.5)*amp*0.22;
+  const mz = (az+bz)*0.5 + (Math.random()-0.5)*amp;
+  boltDisplace(ax,ay,az, mx,my,mz, depth-1, amp*0.58);
+  boltDisplace(mx,my,mz, bx,by,bz, depth-1, amp*0.58);
+}
+
+function generateBolt() {
+  boltN = 0;
+  const h = BOLT_LEN * 0.5;
+  boltPush(0, h, 0);
+  boltDisplace(0, h, 0, 0, -h, 0, BOLT_SEGS, BOLT_AMP);
+  const mainN = boltN;
+
+  // forks: shorter channels branching off random points on the main trunk
+  for (let b = 0; b < BOLT_BRANCH && boltN < BOLT_MAX - 8; b++) {
+    const src = 2 + Math.floor(Math.random() * Math.max(1, mainN - 4));
+    const sx = boltPts[src*3], sy = boltPts[src*3+1], sz = boltPts[src*3+2];
+    const len = BOLT_LEN * (0.16 + Math.random()*0.28);
+    const th = Math.random() * Math.PI * 2;
+    boltDisplace(
+      sx, sy, sz,
+      sx + Math.cos(th)*len*0.85,
+      sy - len*(0.25 + Math.random()*0.55),
+      sz + Math.sin(th)*len*0.85,
+      BOLT_SEGS - 2, BOLT_AMP*0.45
+    );
+  }
+}
+generateBolt();
+
+// per-particle: parametric spot on the channel + scatter around it
+const boltT  = new Float32Array(COUNT);
+const boltJx = new Float32Array(COUNT);
+const boltJy = new Float32Array(COUNT);
+const boltJz = new Float32Array(COUNT);
+for (let i = 0; i < COUNT; i++) {
+  boltT[i]  = Math.random();
+  boltJx[i] = Math.random() - 0.5;
+  boltJy[i] = Math.random() - 0.5;
+  boltJz[i] = Math.random() - 0.5;
 }
 
 // stable per-particle identity — never changes, so the orb has texture even
@@ -746,9 +850,25 @@ function toWorld(lm) {
 const extState = [false, false, false, false];
 let pinchState = false;
 let mPinchState = false;   // thumb + middle, colour-pick gesture
+let boltState = false;     // rock sign, stateful for hysteresis
+let pointState = false;    // index-only, stateful for hysteresis
 const idxTip = { x: 0, y: 0, has: false };   // index tip in normalized 0..1 screen space
 const pinchMid = { x: 0, y: 0, has: false }; // thumb+middle midpoint — palette cursor
 const diskC = { x: 0, y: 0, z: 0 };          // accretion disk centre, world space
+// lightning bolt state
+const boltC = { x: 0, y: 0, z: 0 };          // bolt centre, world space
+let boltSpin = 0, boltTum = 0, boltTimer = 0;
+let bCosY = 1, bSinY = 0, bCosX = 1, bSinX = 0;
+
+function updateBolt(dt, t) {
+  boltSpin += BOLT_SPIN * dt;
+  boltTum   = Math.sin(t * BOLT_TUM_S) * BOLT_TUMBLE;
+  bCosY = Math.cos(boltSpin); bSinY = Math.sin(boltSpin);
+  bCosX = Math.cos(boltTum);  bSinX = Math.sin(boltTum);
+  // periodic re-strike: regenerating the channel is what reads as a flash
+  boltTimer -= dt;
+  if (boltTimer <= 0) { generateBolt(); boltTimer = BOLT_LIFE * (0.7 + Math.random()*0.6); }
+}
 // Disk plane basis: u,v span the plate; n is its normal. Starts HORIZONTAL
 // (normal = world up) then leans toward the camera and wobbles.
 const dkU = { x: 1, y: 0, z: 0 };
@@ -890,7 +1010,6 @@ function calFinish() {
 
   // Pinch gap: above the measured pinch, below a fist's thumb-index gap.
   const pIn  = P.pinchD + Math.max(pinchGap * 0.4,  0.06);
-  const pOut = pIn      + Math.max(pinchGap * 0.35, 0.10);
 
   // Pinch gates: index/thumb must reach further out than they do in a fist.
   const idxGate   = F.idx   + (P.idx   - F.idx)   * 0.45;
@@ -899,7 +1018,6 @@ function calFinish() {
   TH.EXT_IN      = +(mid + band).toFixed(3);
   TH.EXT_OUT     = +(mid - band).toFixed(3);
   TH.PINCH_IN    = +pIn.toFixed(3);
-  TH.PINCH_OUT   = +pOut.toFixed(3);
   TH.PINCH_IDX   = +idxGate.toFixed(3);
   TH.PINCH_THUMB = +thumbGate.toFixed(3);
 
@@ -1115,22 +1233,36 @@ function classify(lm) {
   const midPinch = d3(lm[4], lm[12], scale);    // thumb tip <-> middle tip
   dbg.midD = midPinch;
   if (gesturePick) {
-    const mExit = mPinchState ? TH.MPINCH_OUT : TH.MPINCH_IN;
+    const mExit = mPinchState ? TH.COLOR_OUT : TH.COLOR_IN;
     // require the middle to be clearly closer to the thumb than the index is,
     // which is the one comparison that stays robust
-    const middleWins = midPinch < pinchD * 0.85;
+    const middleWins = midPinch < pinchD * TH.COLOR_RATIO;
     mPinchState = thumbOut > TH.PINCH_THUMB && midPinch < mExit && middleWins;
     if (mPinchState) return 'COLOR';
   } else {
     mPinchState = false;
   }
 
+  // ── ROCK SIGN: index + pinky out, middle + ring curled.
+  // Tested on RAW distances, not the shared extState flags, because the pinky
+  // routinely sits below the general extension bar on a real rock sign — using
+  // the shared flag drops a sloppy horns into POINT (accretion disk).
+  // Requiring index out AND middle+ring curled makes this impossible for a
+  // fist to satisfy: a fist has every finger far below BOLT_IDX.
+  const pinkyOut = dbg.ext[3];
+  const midCurl  = dbg.ext[1], ringCurl = dbg.ext[2];
+  const boltOK = idxOut > TH.BOLT_IDX
+              && midCurl  < TH.BOLT_CURL
+              && ringCurl < TH.BOLT_CURL
+              && pinkyOut > (boltState ? TH.BOLT_PINKY_OUT : TH.BOLT_PINKY_IN);
+  boltState = boltOK;
+  if (boltState) return 'BOLT';
+
   // ── POINT: index out, everything else curled. Accretion disk forms at the
   // fingertip. Distinct from OPEN (>=3 extended) and FIST (0 extended).
-  if (extState[0] && !extState[1] && !extState[2] && !extState[3]
-      && idxOut > TH.POINT_IDX) {
-    return 'POINT';
-  }
+  pointState = extState[0] && !extState[1] && !extState[2] && !extState[3]
+            && idxOut > (pointState ? TH.POINT_OUT : TH.POINT_IN);
+  if (pointState) return 'POINT';
 
   // Asymmetric exit: entering needs a tight gap (PINCH_IN), but once held the
   // gap may open all the way to PINCH_HOLD. That headroom is what lets the
@@ -1250,6 +1382,7 @@ function step(dt, t) {
   const hf   = P.handForce;
   const of   = P.orbForce;
   const df   = P.diskForce;
+  const lf   = P.boltForce;
   const nz   = P.noise;
   const hp   = P.homePull;
 
@@ -1274,6 +1407,8 @@ function step(dt, t) {
 
   // disk plane leans + wobbles; recomputed once per frame, not per particle
   if (df > 0) updateDiskBasis(t);
+  // bolt spins, tumbles and periodically re-strikes
+  if (lf > 0) updateBolt(dt, t);
 
   // advance sphere rotation only while it's actually forming
   if (of > 0.5) orbAngle += ORB_SPIN * dt;
@@ -1365,6 +1500,37 @@ function step(dt, t) {
       const hTgt = diskZ[i] * thick;
       const hf2 = (hTgt - h) * flat * df * dt;
       vx += aN.x * hf2; vy += aN.y * hf2; vz += aN.z * hf2;
+    }
+
+    // LIGHTNING BOLT — spring each particle onto its assigned spot along the
+    // channel. The channel itself is rotated (spin + tumble) once per frame
+    // in world space, so the whole bolt turns in 3D rather than being a flat
+    // sprite. boltT is fixed per particle, so a re-strike reshapes the bolt
+    // without shuffling which particle sits where.
+    if (lf > 0 && boltN > 1) {
+      const seg = boltT[i] * (boltN - 1);
+      const i0 = seg | 0;
+      const i1 = i0 + 1 < boltN ? i0 + 1 : i0;
+      const fr = seg - i0;
+
+      // interpolate along the channel, in bolt-local space
+      const lx = boltPts[i0*3]   + (boltPts[i1*3]   - boltPts[i0*3])   * fr;
+      const ly = boltPts[i0*3+1] + (boltPts[i1*3+1] - boltPts[i0*3+1]) * fr;
+      const lz = boltPts[i0*3+2] + (boltPts[i1*3+2] - boltPts[i0*3+2]) * fr;
+
+      // rotate into world: spin about Y, then tumble about X
+      const rx = lx * bCosY + lz * bSinY;
+      const rz = -lx * bSinY + lz * bCosY;
+      const ry = ly * bCosX - rz * bSinX;
+      const rz2 = ly * bSinX + rz * bCosX;
+
+      const gx = boltC.x + rx + boltJx[i] * BOLT_JIT;
+      const gy = boltC.y + ry + boltJy[i] * BOLT_JIT;
+      const gz = boltC.z + rz2 + boltJz[i] * BOLT_JIT;
+
+      vx += (gx - px) * BOLT_PULL * lf * dt;
+      vy += (gy - py) * BOLT_PULL * lf * dt;
+      vz += (gz - pz) * BOLT_PULL * lf * dt;
     }
 
     // RELEASE BURST — radial shockwave outward from the hold point
@@ -1504,6 +1670,13 @@ function frame(now) {
       diskC.x += (dw.x - diskC.x) * 0.30;
       diskC.y += (dw.y - diskC.y) * 0.30;
       diskC.z += (dw.z - diskC.z) * 0.30;
+
+      // bolt spans index -> pinky, centred between them
+      const bw1 = toWorld(lm[8]), bw2 = toWorld(lm[20]);
+      const bcx = (bw1.x + bw2.x)/2, bcy = (bw1.y + bw2.y)/2, bcz = (bw1.z + bw2.z)/2;
+      boltC.x += (bcx - boltC.x) * 0.28;
+      boltC.y += (bcy - boltC.y) * 0.28;
+      boltC.z += (bcz - boltC.z) * 0.28;
 
       // debounced state switch — per-gesture frame requirement
       const g = classify(lm);
@@ -1674,14 +1847,14 @@ function frame(now) {
     const mark = (v, t) => v > t
       ? `<span class="hi">${f(v)}</span>` : `<span class="lo">${f(v)}</span>`;
     elDbg.innerHTML =
-      `pinch gap ${f(dbg.pinchD)}  (in<${TH.PINCH_IN} out<${TH.PINCH_OUT})\n` +
+      `pinch gap ${f(dbg.pinchD)}  (in<${TH.PINCH_IN} hold<${TH.PINCH_HOLD})\n` +
       `index out ${mark(dbg.idx,   TH.PINCH_IDX)}  (gate >${TH.PINCH_IDX})\n` +
       `thumb out ${mark(dbg.thumb, TH.PINCH_THUMB)}  (gate >${TH.PINCH_THUMB})\n` +
       `ext i/m/r/p ${dbg.ext.map(v=>v.toFixed(2)).join(' ')}  (in>${TH.EXT_IN})\n` +
       `extended  ${dbg.count}   pinchState ${pinchState ? 'Y' : 'n'}\n` +
       `orb r ${orbRadius.toFixed(2)}  gap ${pinchGap.toFixed(2)}  ` +
       `(map ${ORB_GAP_LO}-${ORB_GAP_HI} -> ${ORB_MIN}-${ORB_MAX})\n` +
-      `mid-pinch ${(dbg.midD||0).toFixed(2)} (in<${TH.MPINCH_IN})  ` +
+      `mid-pinch ${(dbg.midD||0).toFixed(2)} (in<${TH.COLOR_IN})  ` +
       `armed ${gesturePick ? 'Y' : 'n'}  mState ${mPinchState ? 'Y' : 'n'}`;
   }
 }
