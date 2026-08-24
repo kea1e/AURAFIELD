@@ -280,7 +280,7 @@ const ORB_JITTER  = 0.09;   // shell thickness — 0 = glassy, higher = fuzzy
 // The disk lies in a HORIZONTAL plane (normal ≈ world up), tilted toward the
 // camera so you see it as a shallow ellipse rather than face-on. That tilt is
 // what makes it read as a black hole rather than a flat swirl.
-const DISK_IN     = 0.30;   // inner edge — the "event horizon" gap
+const DISK_IN     = 0.34;   // inner edge — the "event horizon" gap
 const DISK_OUT    = 1.75;   // outer edge
 const DISK_FLAT   = 14.0;   // how hard particles are pressed into the plane
 const DISK_PULL   = 8.0;    // radial spring onto the assigned orbit
@@ -289,8 +289,14 @@ const DISK_THICK  = 0.035;  // vertical scatter so it isn't a zero-height sheet
 const DISK_TILT   = 0.30;   // radians the plane leans toward camera (~17°)
 const DISK_WOB_A  = 0.12;   // wobble amplitude, radians
 const DISK_WOB_S  = 1.15;   // wobble speed
-const DISK_ARC    = 0.16;   // fraction of particles on the lensed halo ring
-const DISK_ARC_R  = 0.52;   // radius of that ring (just outside the horizon)
+// Photon ring. These were tuned by measuring particles-per-unit-area: the
+// first pass packed 16% of the field into a 0.06-wide band, making the ring
+// 8.7x denser than the disk AND placing it where the temperature alpha boost
+// peaks — hence the congestion. Now it's a wider, thinner, further-out band
+// sitting at ~1.0x disk density.
+const DISK_ARC    = 0.12;   // fraction of particles on the lensed halo ring
+const DISK_ARC_R  = 0.78;   // radius of that ring
+const DISK_ARC_J  = 0.16;   // +/- radial spread of the ring (fraction of R)
 const HAND_RADIUS = 1.5;    // falloff radius for open-hand advection
 const FADE        = 0.16;   // trail persistence (lower = longer trails)
 
@@ -457,7 +463,12 @@ for (let i = 0; i < COUNT; i++) {
   diskZ[i]  = (Math.random() - 0.5) * 2;
   if (Math.random() < DISK_ARC) {
     diskArc[i] = 1;
-    diskR[i] = DISK_ARC_R * (0.94 + Math.random() * 0.12);
+    // spread across the band by AREA, same as the main disk, so the ring
+    // doesn't pile up at its inner edge
+    const lo = DISK_ARC_R * (1 - DISK_ARC_J);
+    const hi = DISK_ARC_R * (1 + DISK_ARC_J);
+    const w = Math.random();
+    diskR[i] = Math.sqrt(lo*lo + w * (hi*hi - lo*lo));
   }
 }
 
@@ -668,8 +679,10 @@ const mat = new THREE.ShaderMaterial({
       // Spectrum mode needs a much tighter alpha ceiling — see the note above.
       a = mix(a, min(a, 0.30), uSpectrum);
       // Disk: hot inner material is denser and brighter, and the Doppler
-      // boost applies to opacity too, not just colour.
-      a = mix(a, clamp(a * (0.45 + vDiskT * 1.15) * vDop, 0.0, 0.95), uDisk);
+      // boost applies to opacity too. The temperature term is deliberately
+      // gentler than the colour ramp (0.75 vs 1.15) — stacking a steep alpha
+      // boost on top of the already-crowded inner radii was reading as mush.
+      a = mix(a, clamp(a * (0.55 + vDiskT * 0.75) * vDop, 0.0, 0.95), uDisk);
       gl_FragColor = vec4(col, clamp(a, 0.0, 1.0));
     }
   `,
@@ -1345,9 +1358,10 @@ function step(dt, t) {
       vx += radX * rErr; vy += radY * rErr; vz += radZ * rErr;
 
       // collapse onto the plane along its normal, keeping a little thickness.
-      // The photon ring is held much tighter — it should read as a thin band.
-      const thick = arc ? DISK_THICK * 0.35 : DISK_THICK;
-      const flat  = arc ? DISK_FLAT * 1.8   : DISK_FLAT;
+      // The photon ring gets a touch more room than before — squeezing it to
+      // a razor band was part of what made it look congested.
+      const thick = arc ? DISK_THICK * 0.9 : DISK_THICK;
+      const flat  = arc ? DISK_FLAT * 1.15 : DISK_FLAT;
       const hTgt = diskZ[i] * thick;
       const hf2 = (hTgt - h) * flat * df * dt;
       vx += aN.x * hf2; vy += aN.y * hf2; vz += aN.z * hf2;
