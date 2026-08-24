@@ -269,8 +269,20 @@ const ORB_MAX     = 1.35;   // fingers spread wide
 const ORB_GAP_LO  = 0.10;   // measured thumb-index gap at a tight pinch
 const ORB_GAP_HI  = 0.85;   // ...and at a wide spread (still gated as pinch)
 const ORB_SMOOTH  = 0.18;   // radius lerp — raw gap is jittery
+// Palette orb is a FIXED size — you're reading colour off it, not sculpting it,
+// so it shouldn't wobble with your pinch. 1.26 is what a 0.79 gap mapped to,
+// which Mr. Crawford identified as the best shape for picking.
+const ORB_COLOR_R = 1.26;
 const ORB_SPIN    = 0.55;   // rad/sec the sphere rotates while held
 const ORB_JITTER  = 0.09;   // shell thickness — 0 = glassy, higher = fuzzy
+
+// ── accretion disk (index finger pointing) ──
+const DISK_IN     = 0.22;   // inner edge — the "event horizon" gap
+const DISK_OUT    = 1.65;   // outer edge
+const DISK_FLAT   = 9.0;    // how hard particles are pressed into the plane
+const DISK_PULL   = 7.0;    // radial spring onto the assigned orbit
+const DISK_SPIN   = 2.35;   // base orbital rate (scaled Keplerian per radius)
+const DISK_THICK  = 0.05;   // vertical scatter so it isn't a zero-height sheet
 const HAND_RADIUS = 1.5;    // falloff radius for open-hand advection
 const FADE        = 0.16;   // trail persistence (lower = longer trails)
 
@@ -301,7 +313,7 @@ const TH = {
   // IN, this one leaves it extended to act as the pointer.
   MPINCH_IN:   0.34,   // thumb <-> middle tip gap to enter
   MPINCH_OUT:  0.52,   // ...and to leave (hysteresis)
-  MPINCH_IDX:  1.05,   // index must stay EXTENDED — it's the cursor
+  POINT_IDX:   1.05,   // index clearly extended for the accretion disk
 };
 const TH_DEFAULTS = { ...TH };
 const Z_WEIGHT    = 0.5;    // MediaPipe z is noisy — count it, but at half weight
@@ -317,20 +329,22 @@ const BURST_R     = 1.1;    // falloff radius of the shockwave
 // per-gesture force parameters — these get LERPED, never hard-switched.
 // `freeze` is the exception: it's a hard boolean, not a lerped force.
 const PARAMS = {
-  IDLE:  { damping:0.985, handForce:0.0, orbForce:0.0,  noise:0.35, homePull:0.30, freeze:0 },
-  OPEN:  { damping:0.960, handForce:9.0, orbForce:0.0,  noise:0.55, homePull:0.00, freeze:0 },
-  FIST:  { damping:0.900, handForce:0.0, orbForce:0.0,  noise:0.00, homePull:0.00, freeze:1 },
-  PINCH: { damping:0.880, handForce:0.0, orbForce:26.0, noise:0.00, homePull:0.00, freeze:0 },
-  // palette: same gathered sphere as PINCH, but anchored where it formed so
-  // the index finger can move independently and point into it
-  COLOR: { damping:0.880, handForce:0.0, orbForce:26.0, noise:0.00, homePull:0.00, freeze:0 },
+  IDLE:  { damping:0.985, handForce:0.0, orbForce:0.0,  diskForce:0.0, noise:0.35, homePull:0.30, freeze:0 },
+  OPEN:  { damping:0.960, handForce:9.0, orbForce:0.0,  diskForce:0.0, noise:0.55, homePull:0.00, freeze:0 },
+  FIST:  { damping:0.900, handForce:0.0, orbForce:0.0,  diskForce:0.0, noise:0.00, homePull:0.00, freeze:1 },
+  PINCH: { damping:0.880, handForce:0.0, orbForce:26.0, diskForce:0.0, noise:0.00, homePull:0.00, freeze:0 },
+  // palette: gathered sphere anchored where it formed, at a fixed size
+  COLOR: { damping:0.880, handForce:0.0, orbForce:26.0, diskForce:0.0, noise:0.00, homePull:0.00, freeze:0 },
+  // accretion disk at the index fingertip
+  POINT: { damping:0.930, handForce:0.0, orbForce:0.0,  diskForce:1.0, noise:0.05, homePull:0.00, freeze:0 },
 };
 const DESC = {
   IDLE:  'waiting for a hand',
   OPEN:  'flowing with hand motion',
   FIST:  'frozen — held mid-flight',
   PINCH: 'gathered into a sphere',
-  COLOR: 'palette — point with your index',
+  COLOR: 'palette — move the pinch to pick',
+  POINT: 'accretion disk',
 };
 
 /* ─────────────────────────── dom ─────────────────────────── */
@@ -414,6 +428,19 @@ function seed() {
   }
   geo.attributes.position.needsUpdate = true;
   geo.attributes.aSpeed.needsUpdate  = true;
+}
+
+// Accretion disk orbits — each particle owns a radius and a starting phase.
+// Radius uses sqrt distribution so particles spread by AREA rather than
+// bunching at the inner edge; phase is randomized so the disk isn't a spiral.
+const diskR   = new Float32Array(COUNT);
+const diskPh  = new Float32Array(COUNT);
+const diskZ   = new Float32Array(COUNT);
+for (let i = 0; i < COUNT; i++) {
+  const u = Math.random();
+  diskR[i]  = Math.sqrt(DISK_IN*DISK_IN + u * (DISK_OUT*DISK_OUT - DISK_IN*DISK_IN));
+  diskPh[i] = Math.random() * Math.PI * 2;
+  diskZ[i]  = (Math.random() - 0.5) * 2;
 }
 
 // stable per-particle identity — never changes, so the orb has texture even
@@ -543,8 +570,15 @@ const mat = new THREE.ShaderMaterial({
       // PALETTE MODE — paint the full spectrum across the orb. Hue comes from
       // the particle's screen angle around the centre, brightness from its
       // distance out, so the sphere IS the colour wheel.
+      //
+      // Values are deliberately DIM here. The palette orb is large (r 1.26),
+      // which puts uDens at its 2.5 ceiling, so alpha would otherwise reach
+      // ~2.1 — additive blending then pins every channel at 1.0 and the whole
+      // sphere reads white. Saturation is pushed up and value pulled down to
+      // leave headroom for the sum, which is what keeps hues distinguishable.
       if (uSpectrum > 0.001) {
-        vec3 spec = hsv2rgb(vec3(vAng, 0.82, 0.45 + vRad * 0.55));
+        float val = 0.20 + vRad * 0.26;
+        vec3 spec = hsv2rgb(vec3(vAng, 0.95, val));
         col = mix(col, spec, uSpectrum);
       }
 
@@ -556,6 +590,8 @@ const mat = new THREE.ShaderMaterial({
       // what keeps individual hues readable instead of washing to white.
       float densA = pow(max(uDens, 0.001), 0.7);
       float a = core * mix(0.85, (0.62 + s * 0.5) * densA, uOrb);
+      // Spectrum mode needs a much tighter alpha ceiling — see the note above.
+      a = mix(a, min(a, 0.30), uSpectrum);
       gl_FragColor = vec4(col, clamp(a, 0.0, 1.0));
     }
   `,
@@ -597,6 +633,8 @@ const extState = [false, false, false, false];
 let pinchState = false;
 let mPinchState = false;   // thumb + middle, colour-pick gesture
 const idxTip = { x: 0, y: 0, has: false };   // index tip in normalized 0..1 screen space
+const pinchMid = { x: 0, y: 0, has: false }; // thumb+middle midpoint — palette cursor
+const diskC = { x: 0, y: 0, z: 0 };          // accretion disk centre, world space
 let gesturePick = false;                     // is hand colour-picking armed?
 const aim = { x: 0, y: 0, on: false };       // legacy panel-wheel cursor
 const pickAim = { x: 0, y: 0, on: false };   // fingertip while picking off the orb
@@ -938,18 +976,29 @@ function classify(lm) {
   const gateOK = idxOut   > TH.PINCH_IDX
               && thumbOut > TH.PINCH_THUMB
               && othersOut >= 2;
-  // ── COLOUR PICK: thumb + MIDDLE finger, index left extended as the cursor.
-  // Checked before the orb pinch because the two are mutually exclusive by
-  // construction: this one requires the index OUT, the orb pinch curls it IN.
+  // ── COLOUR PICK: thumb + MIDDLE finger. The index is NOT part of this test
+  // any more — asking "is the index extended while the middle is pinched" was
+  // unreliable, because curling one finger drags its neighbour partway with it
+  // and the two distances land inside each other's noise. Now the pinched
+  // thumb+middle pair IS the cursor, so no per-finger discrimination is needed.
   const midPinch = d3(lm[4], lm[12], scale);    // thumb tip <-> middle tip
   dbg.midD = midPinch;
   if (gesturePick) {
-    const idxExtended = idxOut > TH.MPINCH_IDX;
     const mExit = mPinchState ? TH.MPINCH_OUT : TH.MPINCH_IN;
-    mPinchState = idxExtended && thumbOut > TH.PINCH_THUMB && midPinch < mExit;
+    // require the middle to be clearly closer to the thumb than the index is,
+    // which is the one comparison that stays robust
+    const middleWins = midPinch < pinchD * 0.85;
+    mPinchState = thumbOut > TH.PINCH_THUMB && midPinch < mExit && middleWins;
     if (mPinchState) return 'COLOR';
   } else {
     mPinchState = false;
+  }
+
+  // ── POINT: index out, everything else curled. Accretion disk forms at the
+  // fingertip. Distinct from OPEN (>=3 extended) and FIST (0 extended).
+  if (extState[0] && !extState[1] && !extState[2] && !extState[3]
+      && idxOut > TH.POINT_IDX) {
+    return 'POINT';
   }
 
   // Asymmetric exit: entering needs a tight gap (PINCH_IN), but once held the
@@ -1002,27 +1051,35 @@ function drawSkeleton(lm) {
     octx.beginPath(); octx.arc(cx, cy, rPx, 0, Math.PI*2); octx.stroke();
   }
   if (gesture === 'COLOR') {
-    // thumb–middle contact line, plus a big reticle on the index tip showing
-    // the colour currently under it
+    // thumb–middle contact line; the pinch midpoint IS the cursor
+    const cx = (px(4)+px(12))/2, cy = (py(4)+py(12))/2;
     octx.strokeStyle = 'rgba(255,255,255,0.9)';
     octx.lineWidth = 3;
     octx.beginPath(); octx.moveTo(px(4),py(4)); octx.lineTo(px(12),py(12)); octx.stroke();
 
-    const ix = px(8), iy = py(8);
-    const cur = hslCss(pal.hue, 85, Math.max(35, pal.light));
+    const cur = hslCss(pal.hue, 88, Math.max(38, pal.light));
     octx.fillStyle = cur;
-    octx.beginPath(); octx.arc(ix, iy, 13, 0, Math.PI*2); octx.fill();
+    octx.beginPath(); octx.arc(cx, cy, 14, 0, Math.PI*2); octx.fill();
     octx.strokeStyle = 'rgba(255,255,255,0.95)';
     octx.lineWidth = 2.5;
-    octx.beginPath(); octx.arc(ix, iy, 13, 0, Math.PI*2); octx.stroke();
-    octx.strokeStyle = 'rgba(255,255,255,0.6)';
+    octx.beginPath(); octx.arc(cx, cy, 14, 0, Math.PI*2); octx.stroke();
+    octx.strokeStyle = 'rgba(255,255,255,0.55)';
     octx.lineWidth = 1.5;
     octx.beginPath();
-    octx.moveTo(ix-24, iy); octx.lineTo(ix-17, iy);
-    octx.moveTo(ix+17, iy); octx.lineTo(ix+24, iy);
-    octx.moveTo(ix, iy-24); octx.lineTo(ix, iy-17);
-    octx.moveTo(ix, iy+17); octx.lineTo(ix, iy+24);
+    octx.moveTo(cx-26, cy); octx.lineTo(cx-18, cy);
+    octx.moveTo(cx+18, cy); octx.lineTo(cx+26, cy);
+    octx.moveTo(cx, cy-26); octx.lineTo(cx, cy-18);
+    octx.moveTo(cx, cy+18); octx.lineTo(cx, cy+26);
     octx.stroke();
+  }
+  if (gesture === 'POINT') {
+    // ring at the fingertip marking the disk's centre
+    const ix = px(8), iy = py(8);
+    octx.strokeStyle = 'rgba(255,220,150,0.9)';
+    octx.lineWidth = 2;
+    octx.beginPath(); octx.arc(ix, iy, 10, 0, Math.PI*2); octx.stroke();
+    octx.fillStyle = 'rgba(255,240,200,0.95)';
+    octx.beginPath(); octx.arc(ix, iy, 4, 0, Math.PI*2); octx.fill();
   }
   if (gesture === 'FIST') {
     // bracket corners at the palm — freeze-frame marker
@@ -1061,6 +1118,7 @@ function step(dt, t) {
 
   const hf   = P.handForce;
   const of   = P.orbForce;
+  const df   = P.diskForce;
   const nz   = P.noise;
   const hp   = P.homePull;
 
@@ -1122,6 +1180,32 @@ function step(dt, t) {
       vx += (gx - px) * of * dt;
       vy += (gy - py) * of * dt;
       vz += (gz - pz) * of * dt;
+    }
+
+    // ACCRETION DISK — orbit the fingertip in a flat plane facing the camera.
+    // Each particle springs onto its own assigned orbit radius and rides a
+    // Keplerian-ish angular rate (inner orbits sweep faster), which is what
+    // produces the sheared, banded look rather than a rigid spinning plate.
+    if (df > 0) {
+      const px2 = px - diskC.x, py2 = py - diskC.y, pz2 = pz - diskC.z;
+      const rNow = Math.sqrt(px2*px2 + py2*py2) || 1e-5;
+      const rTgt = diskR[i];
+
+      // angular position, advanced by radius-dependent rate
+      const ang = Math.atan2(py2, px2) + diskPh[i] * 0.0;
+      const rate = DISK_SPIN / Math.pow(rTgt, 0.62);   // faster when closer in
+      const tx = -Math.sin(ang), ty = Math.cos(ang);   // tangent
+      vx += tx * rate * df * dt * 0.55;
+      vy += ty * rate * df * dt * 0.55;
+
+      // radial spring onto the assigned orbit
+      const rErr = (rTgt - rNow) * DISK_PULL * df * dt;
+      vx += (px2/rNow) * rErr;
+      vy += (py2/rNow) * rErr;
+
+      // flatten into the plane, but keep a little thickness
+      const zTgt = diskC.z + diskZ[i] * DISK_THICK;
+      vz += (zTgt - pz) * DISK_FLAT * df * dt;
     }
 
     // RELEASE BURST — radial shockwave outward from the hold point
@@ -1246,10 +1330,21 @@ function frame(now) {
       }
 
       // index fingertip in normalized screen space (mirrored to match the
-      // selfie view) — this is the cursor for colour picking
+      // selfie view) — drives the accretion disk centre
       idxTip.x = 1 - lm[8].x;
       idxTip.y = lm[8].y;
       idxTip.has = true;
+
+      // thumb+middle midpoint — the palette cursor
+      pinchMid.x = 1 - (lm[4].x + lm[12].x) / 2;
+      pinchMid.y = (lm[4].y + lm[12].y) / 2;
+      pinchMid.has = true;
+
+      // accretion disk anchors on the index fingertip, smoothed
+      const dw = toWorld(lm[8]);
+      diskC.x += (dw.x - diskC.x) * 0.30;
+      diskC.y += (dw.y - diskC.y) * 0.30;
+      diskC.z += (dw.z - diskC.z) * 0.30;
 
       // debounced state switch — per-gesture frame requirement
       const g = classify(lm);
@@ -1295,10 +1390,11 @@ function frame(now) {
   }
   P.freeze = T.freeze;                 // instant, so the hold is exact
 
-  // ── pinch spread drives orb size. Only tracked while PINCH is the active
-  // gesture; any other state eases the radius back to its base so the next
-  // pinch starts from a neutral size.
-  if (gesture === 'PINCH') {
+  // ── pinch spread drives orb size — but NOT in palette mode, where the orb
+  // is a fixed-size instrument you read colour off rather than sculpt.
+  if (gesture === 'COLOR') {
+    orbRadius += (ORB_COLOR_R - orbRadius) * 0.10;
+  } else if (gesture === 'PINCH') {
     const norm = (pinchGap - ORB_GAP_LO) / (ORB_GAP_HI - ORB_GAP_LO);
     const target = ORB_MIN + (ORB_MAX - ORB_MIN) * Math.max(0, Math.min(1, norm));
     orbRadius += (target - orbRadius) * ORB_SMOOTH;
@@ -1306,22 +1402,18 @@ function frame(now) {
     orbRadius += (ORB_RADIUS - orbRadius) * 0.06;
   }
 
-  // ── PALETTE MODE: the orb itself is the colour wheel.
-  // Project the anchored orb centre to screen, compare the index fingertip
-  // against it, and read hue from the angle / brightness from the distance.
-  // No aim gain needed — the orb is hundreds of px across, so raw fingertip
-  // motion is already precise. (Aiming at the 180px panel wheel needed 2.6x
-  // amplification, which multiplied MediaPipe's jitter by 2.6x too. That was
-  // the jank.)
+  // ── PALETTE MODE: the orb is the colour wheel, the PINCH is the cursor.
+  // Using the thumb+middle midpoint instead of the index tip removes the
+  // fragile "which finger is which" discrimination entirely — the pinch you
+  // are already making to hold the gesture is the thing that aims.
   if (gesture === 'COLOR') {
     mat.uniforms.uSpectrum.value = Math.min(mat.uniforms.uSpectrum.value + dt * 4.0, 1.0);
 
-    if (idxTip.has) {
+    if (pinchMid.has) {
       const p = new THREE.Vector3(orb.x, orb.y, orb.z).project(camera);
       mat.uniforms.uOrbNDC.value.set(p.x, p.y);
-      // fingertip -> NDC, matching the shader's aspect-corrected space
-      const fx = idxTip.x * 2 - 1;
-      const fy = -(idxTip.y * 2 - 1);
+      const fx = pinchMid.x * 2 - 1;
+      const fy = -(pinchMid.y * 2 - 1);
       const dx = (fx - p.x) * camera.aspect;
       const dy = fy - p.y;
       const dist = Math.sqrt(dx*dx + dy*dy);
@@ -1330,7 +1422,7 @@ function frame(now) {
       if (dist > 0.05) {
         const targetHue = ((Math.atan2(dy, dx) * 180/Math.PI) + 180) % 360;
         const norm = Math.min(dist / 0.42, 1);
-        const targetL = 32 + norm * 42;
+        const targetL = 34 + norm * 40;
         let dh = targetHue - pal.hue;
         if (dh >  180) dh -= 360;
         if (dh < -180) dh += 360;
@@ -1338,7 +1430,7 @@ function frame(now) {
         pal.light = pal.light + (targetL - pal.light) * 0.22;
         applyPalette();
       }
-      pickAim.x = idxTip.x; pickAim.y = idxTip.y; pickAim.on = true;
+      pickAim.x = pinchMid.x; pickAim.y = pinchMid.y; pickAim.on = true;
     }
   } else {
     mat.uniforms.uSpectrum.value = Math.max(mat.uniforms.uSpectrum.value - dt * 3.0, 0.0);
