@@ -286,9 +286,11 @@ const DISK_FLAT   = 14.0;   // how hard particles are pressed into the plane
 const DISK_PULL   = 8.0;    // radial spring onto the assigned orbit
 const DISK_SPIN   = 3.2;    // base orbital rate (scaled Keplerian per radius)
 const DISK_THICK  = 0.035;  // vertical scatter so it isn't a zero-height sheet
-const DISK_TILT   = 0.42;   // radians the plane leans toward camera (~24°)
-const DISK_WOB_A  = 0.16;   // wobble amplitude, radians
+const DISK_TILT   = 0.30;   // radians the plane leans toward camera (~17°)
+const DISK_WOB_A  = 0.12;   // wobble amplitude, radians
 const DISK_WOB_S  = 1.15;   // wobble speed
+const DISK_ARC    = 0.16;   // fraction of particles on the lensed halo ring
+const DISK_ARC_R  = 0.52;   // radius of that ring (just outside the horizon)
 const HAND_RADIUS = 1.5;    // falloff radius for open-hand advection
 const FADE        = 0.16;   // trail persistence (lower = longer trails)
 
@@ -442,11 +444,21 @@ function seed() {
 const diskR   = new Float32Array(COUNT);
 const diskPh  = new Float32Array(COUNT);
 const diskZ   = new Float32Array(COUNT);
+// Photon-ring members orbit in a plane PERPENDICULAR to the disk, which is
+// what draws the arc that appears to rise over the top of the hole — the
+// Interstellar look. Real lensing bends light from the far side of the disk
+// up and over; simulating that directly is out of scope, so a subset of
+// particles is simply put on a vertical ring instead.
+const diskArc = new Uint8Array(COUNT);
 for (let i = 0; i < COUNT; i++) {
   const u = Math.random();
   diskR[i]  = Math.sqrt(DISK_IN*DISK_IN + u * (DISK_OUT*DISK_OUT - DISK_IN*DISK_IN));
   diskPh[i] = Math.random() * Math.PI * 2;
   diskZ[i]  = (Math.random() - 0.5) * 2;
+  if (Math.random() < DISK_ARC) {
+    diskArc[i] = 1;
+    diskR[i] = DISK_ARC_R * (0.94 + Math.random() * 0.12);
+  }
 }
 
 // stable per-particle identity — never changes, so the orb has texture even
@@ -478,6 +490,13 @@ const mat = new THREE.ShaderMaterial({
     uSpectrum: { value: 0.0 },                        // 0 = normal, 1 = rainbow
     uOrbNDC:   { value: new THREE.Vector2(0, 0) },    // orb centre in NDC
     uAspect:   { value: 1.0 },
+    // ── accretion disk rendering ──
+    uDisk:   { value: 0.0 },                          // 0 = off, 1 = full disk look
+    uDiskC:  { value: new THREE.Vector3(0,0,0) },
+    uDiskU:  { value: new THREE.Vector3(1,0,0) },
+    uDiskV:  { value: new THREE.Vector3(0,0,1) },
+    uDiskIn: { value: 0.30 },
+    uDiskOut:{ value: 1.75 },
   },
   vertexShader: `
     attribute float aSpeed;
@@ -487,6 +506,8 @@ const mat = new THREE.ShaderMaterial({
     varying float vShade;
     varying float vAng;    // screen-space angle around the orb, 0..1
     varying float vRad;    // screen-space distance from orb centre, 0..1
+    varying float vDiskT;  // disk temperature 0..1 (1 = inner, white-hot)
+    varying float vDop;    // Doppler beaming factor, ~0.35..1.9
     uniform float uSize;
     uniform float uPR;
     uniform float uOrb;
@@ -496,6 +517,12 @@ const mat = new THREE.ShaderMaterial({
     uniform float uSpectrum;
     uniform vec2  uOrbNDC;
     uniform float uAspect;
+    uniform float uDisk;
+    uniform vec3  uDiskC;
+    uniform vec3  uDiskU;
+    uniform vec3  uDiskV;
+    uniform float uDiskIn;
+    uniform float uDiskOut;
     void main() {
       vS = aSpeed;
       vSeed = aSeed;
@@ -522,6 +549,30 @@ const mat = new THREE.ShaderMaterial({
       vec2 d   = vec2((ndc.x - uOrbNDC.x) * uAspect, ndc.y - uOrbNDC.y);
       vAng = (atan(d.y, d.x) + 3.14159265) / 6.2831853;   // 0..1
       vRad = clamp(length(d) / 0.42, 0.0, 1.0);
+
+      // ── ACCRETION DISK shading inputs ──
+      // Temperature rises steeply toward the horizon (real disks go as
+      // r^-3/4; exaggerated here so the inner edge reads white-hot).
+      // Doppler beaming: the limb rotating TOWARD the camera is boosted,
+      // the receding limb dimmed. That asymmetry is the single strongest
+      // visual cue that this is a black hole and not a glowing donut.
+      vDiskT = 0.0;
+      vDop   = 1.0;
+      if (uDisk > 0.001) {
+        vec3 rel = position - uDiskC;
+        float pu = dot(rel, uDiskU);
+        float pv = dot(rel, uDiskV);
+        float r  = max(sqrt(pu*pu + pv*pv), 1e-4);
+        float tN = clamp((r - uDiskIn) / max(uDiskOut - uDiskIn, 1e-4), 0.0, 1.0);
+        vDiskT = pow(1.0 - tN, 2.2);
+
+        // orbital velocity direction, projected onto the view axis
+        vec3 tang = (-pv / r) * uDiskU + (pu / r) * uDiskV;
+        vec3 vdir = normalize((modelViewMatrix * vec4(tang, 0.0)).xyz);
+        float toward = -vdir.z;                    // camera looks down -Z
+        float speed = 1.0 / pow(max(r, 0.12), 0.5); // faster deeper in
+        vDop = clamp(1.0 + toward * speed * 0.62, 0.32, 1.95);
+      }
     }
   `,
   fragmentShader: `
@@ -530,6 +581,8 @@ const mat = new THREE.ShaderMaterial({
     varying float vShade;
     varying float vAng;
     varying float vRad;
+    varying float vDiskT;
+    varying float vDop;
     uniform vec3 uCold;
     uniform vec3 uWarm;
     uniform vec3 uHot;
@@ -537,6 +590,7 @@ const mat = new THREE.ShaderMaterial({
     uniform float uOrb;
     uniform float uDens;
     uniform float uSpectrum;
+    uniform float uDisk;
 
     vec3 hsv2rgb(vec3 c) {
       vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
@@ -588,6 +642,21 @@ const mat = new THREE.ShaderMaterial({
         col = mix(col, spec, uSpectrum);
       }
 
+      // ── ACCRETION DISK: blackbody ramp + Doppler beaming.
+      // Deep red at the cool outer rim through orange and gold to a
+      // blue-white inner edge, then multiplied by the Doppler factor so the
+      // approaching limb blazes and the receding one falls to embers.
+      if (uDisk > 0.001) {
+        float T = vDiskT;
+        vec3 hot;
+        if (T < 0.34)      hot = mix(vec3(0.42,0.055,0.012), vec3(0.95,0.30,0.03), T/0.34);
+        else if (T < 0.66) hot = mix(vec3(0.95,0.30,0.03),  vec3(1.0,0.72,0.26), (T-0.34)/0.32);
+        else if (T < 0.88) hot = mix(vec3(1.0,0.72,0.26),   vec3(1.0,0.96,0.80), (T-0.66)/0.22);
+        else               hot = mix(vec3(1.0,0.96,0.80),   vec3(0.86,0.95,1.0), (T-0.88)/0.12);
+        hot *= vDop;
+        col = mix(col, hot, uDisk);
+      }
+
       // Density compensation is the actual fix for "small orb goes white":
       // additive blending SUMS overlapping fragments, so packing the same 40k
       // particles onto a tighter shell clips every channel to 1.0. Scaling
@@ -598,6 +667,9 @@ const mat = new THREE.ShaderMaterial({
       float a = core * mix(0.85, (0.62 + s * 0.5) * densA, uOrb);
       // Spectrum mode needs a much tighter alpha ceiling — see the note above.
       a = mix(a, min(a, 0.30), uSpectrum);
+      // Disk: hot inner material is denser and brighter, and the Doppler
+      // boost applies to opacity too, not just colour.
+      a = mix(a, clamp(a * (0.45 + vDiskT * 1.15) * vDop, 0.0, 0.95), uDisk);
       gl_FragColor = vec4(col, clamp(a, 0.0, 1.0));
     }
   `,
@@ -606,6 +678,29 @@ const mat = new THREE.ShaderMaterial({
   depthWrite: false,
   depthTest: false,
 });
+
+// ── event horizon ──
+// A genuinely black sphere at the disk centre. It must be OPAQUE and depth-
+// tested against the particles: without something actually occluding the far
+// side of the disk, additive blending fills the middle with light and you get
+// a glowing donut instead of a black hole.
+const horizon = new THREE.Mesh(
+  new THREE.SphereGeometry(1, 32, 24),
+  new THREE.MeshBasicMaterial({ color: 0x000000 })
+);
+horizon.visible = false;
+scene.add(horizon);
+
+// faint rim glow just outside the horizon, sells the "light bending" edge
+const horizonRim = new THREE.Mesh(
+  new THREE.SphereGeometry(1, 32, 24),
+  new THREE.MeshBasicMaterial({
+    color: 0xffb060, transparent: true, opacity: 0.14,
+    side: THREE.BackSide, blending: THREE.AdditiveBlending, depthWrite: false,
+  })
+);
+horizonRim.visible = false;
+scene.add(horizonRim);
 
 scene.add(new THREE.Points(geo, mat));
 seed();
@@ -1215,10 +1310,18 @@ function step(dt, t) {
     if (df > 0) {
       const dx0 = px - diskC.x, dy0 = py - diskC.y, dz0 = pz - diskC.z;
 
+      // Photon-ring particles use a plane rotated 90° about u, so their
+      // "in-plane" axes are (u, n) and their normal is v. Everything below
+      // is identical apart from that swap.
+      const arc = diskArc[i] === 1;
+      const aU = dkU;
+      const aV = arc ? dkN : dkV;
+      const aN = arc ? dkV : dkN;
+
       // decompose into in-plane (u,v) and out-of-plane (n) components
-      const pu = dx0*dkU.x + dy0*dkU.y + dz0*dkU.z;
-      const pv = dx0*dkV.x + dy0*dkV.y + dz0*dkV.z;
-      const h  = dx0*dkN.x + dy0*dkN.y + dz0*dkN.z;
+      const pu = dx0*aU.x + dy0*aU.y + dz0*aU.z;
+      const pv = dx0*aV.x + dy0*aV.y + dz0*aV.z;
+      const h  = dx0*aN.x + dy0*aN.y + dz0*aN.z;
 
       const rNow = Math.sqrt(pu*pu + pv*pv) || 1e-5;
       const rTgt = diskR[i];
@@ -1228,23 +1331,26 @@ function step(dt, t) {
       // outer ones — that differential is what sells it as a disk.
       const cs = pu / rNow, sn = pv / rNow;
       const rate = DISK_SPIN / Math.pow(rTgt, 0.62);
-      const tanX = -sn*dkU.x + cs*dkV.x;
-      const tanY = -sn*dkU.y + cs*dkV.y;
-      const tanZ = -sn*dkU.z + cs*dkV.z;
+      const tanX = -sn*aU.x + cs*aV.x;
+      const tanY = -sn*aU.y + cs*aV.y;
+      const tanZ = -sn*aU.z + cs*aV.z;
       const tf = rate * df * dt;
       vx += tanX * tf; vy += tanY * tf; vz += tanZ * tf;
 
       // radial spring onto the assigned orbit, along the in-plane radius
       const rErr = (rTgt - rNow) * DISK_PULL * df * dt;
-      const radX = cs*dkU.x + sn*dkV.x;
-      const radY = cs*dkU.y + sn*dkV.y;
-      const radZ = cs*dkU.z + sn*dkV.z;
+      const radX = cs*aU.x + sn*aV.x;
+      const radY = cs*aU.y + sn*aV.y;
+      const radZ = cs*aU.z + sn*aV.z;
       vx += radX * rErr; vy += radY * rErr; vz += radZ * rErr;
 
-      // collapse onto the plane along its normal, keeping a little thickness
-      const hTgt = diskZ[i] * DISK_THICK;
-      const hf2 = (hTgt - h) * DISK_FLAT * df * dt;
-      vx += dkN.x * hf2; vy += dkN.y * hf2; vz += dkN.z * hf2;
+      // collapse onto the plane along its normal, keeping a little thickness.
+      // The photon ring is held much tighter — it should read as a thin band.
+      const thick = arc ? DISK_THICK * 0.35 : DISK_THICK;
+      const flat  = arc ? DISK_FLAT * 1.8   : DISK_FLAT;
+      const hTgt = diskZ[i] * thick;
+      const hf2 = (hTgt - h) * flat * df * dt;
+      vx += aN.x * hf2; vy += aN.y * hf2; vz += aN.z * hf2;
     }
 
     // RELEASE BURST — radial shockwave outward from the hold point
@@ -1492,6 +1598,37 @@ function frame(now) {
   // for flattest brightness across the range (1.7x spread vs 9.8x raw).
   const areaRatio = (orbRadius * orbRadius) / (ORB_RADIUS * ORB_RADIUS);
   mat.uniforms.uDens.value = Math.max(0.20, Math.min(2.5, areaRatio));
+
+  // ── accretion disk visuals
+  const diskOn = (gesture === 'POINT');
+  const dTarget = diskOn ? 1 : 0;
+  mat.uniforms.uDisk.value += (dTarget - mat.uniforms.uDisk.value) * Math.min(dt * 5, 1);
+  const dv = mat.uniforms.uDisk.value;
+
+  if (dv > 0.01) {
+    mat.uniforms.uDiskC.value.set(diskC.x, diskC.y, diskC.z);
+    mat.uniforms.uDiskU.value.set(dkU.x, dkU.y, dkU.z);
+    mat.uniforms.uDiskV.value.set(dkV.x, dkV.y, dkV.z);
+    mat.uniforms.uDiskIn.value  = DISK_IN;
+    mat.uniforms.uDiskOut.value = DISK_OUT;
+
+    // The horizon only occludes if particles are depth-TESTED against it.
+    // Everywhere else in this app depth testing is off (additive particles
+    // don't need it), so it gets switched on just for disk mode.
+    mat.depthTest = true;
+    const hr = DISK_IN * 0.82 * dv;
+    horizon.visible = true;
+    horizon.position.set(diskC.x, diskC.y, diskC.z);
+    horizon.scale.setScalar(Math.max(hr, 0.001));
+    horizonRim.visible = true;
+    horizonRim.position.copy(horizon.position);
+    horizonRim.scale.setScalar(Math.max(hr * 1.22, 0.001));
+    horizonRim.material.opacity = 0.14 * dv;
+  } else {
+    mat.depthTest = false;
+    horizon.visible = false;
+    horizonRim.visible = false;
+  }
 
   // ── render: fade quad first, then additive points.
   // While frozen we skip the fade — otherwise the trail buffer would keep
