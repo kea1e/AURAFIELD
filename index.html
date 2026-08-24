@@ -1,0 +1,1086 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AURAFIELD — hand-tracked particle field</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { width:100%; height:100%; overflow:hidden; background:#000; }
+  body { font-family: ui-monospace, "SF Mono", Menlo, monospace; color:#8fd8ff; }
+
+  #af-gl { position:fixed; inset:0; display:block; z-index:1; }
+  #af-overlay { position:fixed; inset:0; z-index:2; pointer-events:none; }
+
+  #af-cam {
+    position:fixed; right:16px; bottom:16px;
+    width:220px; border-radius:8px; z-index:4;
+    transform: scaleX(-1);
+    border:1px solid rgba(143,216,255,0.25);
+    box-shadow:0 6px 30px rgba(0,0,0,0.8);
+  }
+  #af-cam.hidden { display:none; }
+
+  #af-hud {
+    position:fixed; left:18px; top:16px; z-index:5;
+    font-size:12px; line-height:1.65; letter-spacing:0.04em;
+    text-shadow:0 0 12px rgba(0,140,255,0.55);
+    user-select:none;
+  }
+  #af-hud.hidden { display:none; }
+  #af-title { font-size:19px; letter-spacing:0.34em; color:#dff4ff; margin-bottom:10px; font-weight:600; }
+  .row { color:#5e8aa8; }
+  .row b { color:#bfeaff; font-weight:600; }
+
+  #af-gesture {
+    margin-top:12px; font-size:26px; letter-spacing:0.16em;
+    color:#fff; text-shadow:0 0 26px rgba(0,190,255,0.95);
+  }
+  #af-gdesc { color:#5e8aa8; font-size:11px; margin-top:2px; letter-spacing:0.06em; }
+
+  #af-debug {
+    margin-top:14px; font-size:10.5px; line-height:1.7; color:#4d7a92;
+    letter-spacing:0.02em; white-space:pre; display:none;
+  }
+  #af-debug.on { display:block; }
+  #af-debug .hi { color:#7dffa8; }
+  #af-debug .lo { color:#ff7d9b; }
+
+  #af-keys {
+    position:fixed; left:18px; bottom:16px; z-index:5; font-size:10.5px;
+    color:#43647a; letter-spacing:0.05em; line-height:1.8;
+  }
+  #af-keys.hidden { display:none; }
+  #af-keys kbd {
+    background:rgba(143,216,255,0.10); border:1px solid rgba(143,216,255,0.22);
+    border-radius:3px; padding:1px 5px; color:#9fd6f0; font-family:inherit;
+  }
+
+  #af-boot {
+    position:fixed; inset:0; z-index:9; display:flex; flex-direction:column;
+    align-items:center; justify-content:center; background:#000; gap:16px;
+    transition:opacity 0.7s ease; text-align:center; padding:24px;
+  }
+  #af-boot.gone { opacity:0; pointer-events:none; }
+  #af-boot h1 { font-size:34px; letter-spacing:0.42em; color:#dff4ff; font-weight:600; }
+  #af-boot p { color:#4d7a92; font-size:13px; max-width:460px; line-height:1.7; }
+  #af-boot .err { color:#ff6b8a; font-size:12px; max-width:520px; line-height:1.7; }
+
+  #af-cal {
+    position:fixed; inset:0; z-index:8; display:none;
+    align-items:center; justify-content:center;
+    background:rgba(0,0,0,0.55); backdrop-filter:blur(3px);
+  }
+  #af-cal.on { display:flex; }
+  #af-cal-card {
+    text-align:center; padding:34px 46px; border-radius:12px;
+    background:rgba(6,14,24,0.92);
+    border:1px solid rgba(143,216,255,0.22);
+    box-shadow:0 16px 60px rgba(0,0,0,0.7);
+    min-width:400px;
+  }
+  #af-cal-step {
+    font-size:10.5px; letter-spacing:0.34em; color:#4d7a92; margin-bottom:18px;
+  }
+  #af-cal-title {
+    font-size:30px; letter-spacing:0.20em; color:#dff4ff; font-weight:600;
+    text-shadow:0 0 30px rgba(0,190,255,0.7);
+  }
+  #af-cal-hint {
+    font-size:12px; color:#6f9bb5; margin-top:10px; letter-spacing:0.04em;
+    min-height:18px;
+  }
+  #af-cal-track {
+    margin-top:22px; height:3px; width:100%;
+    background:rgba(143,216,255,0.13); border-radius:2px; overflow:hidden;
+  }
+  #af-cal-bar {
+    height:100%; width:0%; border-radius:2px;
+    background:linear-gradient(90deg,#1e3fa8,#27d8ff);
+    transition:width 0.08s linear;
+  }
+  #af-cal-skip {
+    margin-top:20px; font-size:10px; color:#3d5c70; letter-spacing:0.06em;
+  }
+</style>
+</head>
+<body>
+
+<canvas id="af-gl"></canvas>
+<canvas id="af-overlay"></canvas>
+<video id="af-cam" autoplay playsinline muted></video>
+
+<div id="af-hud">
+  <div id="af-title">AURAFIELD</div>
+  <div class="row">fps <b id="af-fps">—</b></div>
+  <div class="row">particles <b id="af-pcount">—</b></div>
+  <div class="row">hand <b id="af-handstate">searching…</b></div>
+  <div id="af-gesture">—</div>
+  <div id="af-gdesc">waiting for a hand</div>
+  <div id="af-debug"></div>
+</div>
+
+<div id="af-keys">
+  <kbd>H</kbd> hud &nbsp; <kbd>V</kbd> camera &nbsp; <kbd>S</kbd> skeleton &nbsp;
+  <kbd>D</kbd> debug &nbsp; <kbd>R</kbd> reset &nbsp; <kbd>Space</kbd> pause<br>
+  <kbd>C</kbd> recalibrate &nbsp; <kbd>X</kbd> reset calibration
+</div>
+
+<div id="af-cal">
+  <div id="af-cal-card">
+    <div id="af-cal-step">CALIBRATION</div>
+    <div id="af-cal-title">SHOW YOUR HAND</div>
+    <div id="af-cal-hint">waiting for tracking…</div>
+    <div id="af-cal-track"><div id="af-cal-bar"></div></div>
+    <div id="af-cal-skip">ESC to skip · C to recalibrate anytime</div>
+  </div>
+</div>
+
+<div id="af-boot">
+  <h1>AURAFIELD</h1>
+  <p id="af-bootmsg">initializing — allow camera access when Chrome asks</p>
+  <p class="err" id="af-booterr"></p>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { HandLandmarker, FilesetResolver }
+  from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs';
+
+/* ─────────────────────────── config ─────────────────────────── */
+const COUNT       = 40000;
+const ORB_RADIUS  = 0.62;
+const ORB_SPIN    = 0.55;   // rad/sec the sphere rotates while held
+const ORB_JITTER  = 0.09;   // shell thickness — 0 = glassy, higher = fuzzy
+const HAND_RADIUS = 1.5;    // falloff radius for open-hand advection
+const FADE        = 0.16;   // trail persistence (lower = longer trails)
+
+// gesture thresholds — DEFAULTS, derived from REAL measured hand data
+// (see AF_STATS capture 2026-08-24). Calibration can refine these per-user,
+// but these numbers already work standalone.
+//
+//   measured, open hand : ext/finger ~1.07  idx 1.14  thumb 0.80  pinchGap 1.27
+//   measured, fist      : ext/finger ~0.16  idx 0.28  thumb 0.26  pinchGap 0.26
+//   measured, pinch     : ext/finger ~0.91  idx 0.53  thumb 0.47  pinchGap 0.15
+//
+// The open/fist separation is enormous (1.07 vs 0.16), so EXT sits between.
+// Pinch is the subtle one: its INDEX curls in (0.53) while middle/ring/pinky
+// stay out — which is exactly how it differs from both fist and open hand.
+const TH = {
+  PINCH_IN:    0.30,   // thumb-index gap: pinch measures 0.15, fist 0.26
+  PINCH_OUT:   0.45,
+  EXT_IN:      0.62,   // finger extended: fist ~0.16, open ~1.07
+  EXT_OUT:     0.45,
+  PINCH_IDX:   0.40,   // index must be out of the palm: fist 0.28, pinch 0.53
+  PINCH_THUMB: 0.36,   // thumb likewise: fist 0.26, pinch 0.47
+};
+const TH_DEFAULTS = { ...TH };
+const Z_WEIGHT    = 0.5;    // MediaPipe z is noisy — count it, but at half weight
+const DEBOUNCE    = { PINCH: 3, OPEN: 3, FIST: 4, IDLE: 4 };
+const CAL_KEY     = 'aurafield.calibration.v2';   // v1 held bad auto-test data
+
+// release burst — fires on PINCH/FIST -> OPEN
+const BURST_TIME  = 0.45;   // seconds the shockwave lasts
+const BURST_PINCH = 24.0;   // sphere is dense + centered, needs a hard kick
+const BURST_FIST  = 7.0;    // frozen field is already spread — just a push
+const BURST_R     = 1.1;    // falloff radius of the shockwave
+
+// per-gesture force parameters — these get LERPED, never hard-switched.
+// `freeze` is the exception: it's a hard boolean, not a lerped force.
+const PARAMS = {
+  IDLE:  { damping:0.985, handForce:0.0, orbForce:0.0,  noise:0.35, homePull:0.30, freeze:0 },
+  OPEN:  { damping:0.960, handForce:9.0, orbForce:0.0,  noise:0.55, homePull:0.00, freeze:0 },
+  FIST:  { damping:0.900, handForce:0.0, orbForce:0.0,  noise:0.00, homePull:0.00, freeze:1 },
+  PINCH: { damping:0.880, handForce:0.0, orbForce:26.0, noise:0.00, homePull:0.00, freeze:0 },
+};
+const DESC = {
+  IDLE:  'waiting for a hand',
+  OPEN:  'flowing with hand motion',
+  FIST:  'frozen — held mid-flight',
+  PINCH: 'gathered into a sphere',
+};
+
+/* ─────────────────────────── dom ─────────────────────────── */
+const glCanvas = document.getElementById('af-gl');
+const overlay  = document.getElementById('af-overlay');
+const octx     = overlay.getContext('2d');
+const video    = document.getElementById('af-cam');
+const boot     = document.getElementById('af-boot');
+const bootmsg  = document.getElementById('af-bootmsg');
+const booterr  = document.getElementById('af-booterr');
+const elFps    = document.getElementById('af-fps');
+const elCount  = document.getElementById('af-pcount');
+const elHand   = document.getElementById('af-handstate');
+const elGest   = document.getElementById('af-gesture');
+const elDesc   = document.getElementById('af-gdesc');
+const elDbg    = document.getElementById('af-debug');
+const elCal      = document.getElementById('af-cal');
+const elCalTitle = document.getElementById('af-cal-title');
+const elCalHint  = document.getElementById('af-cal-hint');
+const elCalBar   = document.getElementById('af-cal-bar');
+const elCalStep  = document.getElementById('af-cal-step');
+
+/* ─────────────────────────── three ─────────────────────────── */
+const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias:false, alpha:false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.autoClear = false;
+
+const scene  = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 100);
+camera.position.z = 5;
+
+// world extents at the z=0 plane
+let visH = 2 * 5 * Math.tan(THREE.MathUtils.degToRad(30));
+let visW = visH * (innerWidth/innerHeight);
+const DEPTH = 1.8;
+
+// trail fade quad
+const fadeScene = new THREE.Scene();
+const fadeCam   = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+fadeScene.add(new THREE.Mesh(
+  new THREE.PlaneGeometry(2,2),
+  new THREE.MeshBasicMaterial({ color:0x000000, transparent:true, opacity:FADE, depthTest:false })
+));
+
+/* ─────────────────────────── particles ─────────────────────────── */
+const pos   = new Float32Array(COUNT * 3);
+const vel   = new Float32Array(COUNT * 3);
+const home  = new Float32Array(COUNT * 3);
+const speed = new Float32Array(COUNT);
+
+// Fibonacci sphere — each particle owns ONE point on the shell.
+// This is what makes it read as a sphere: without assigned targets,
+// a radial "distance == R" force lets particles clump anywhere on the
+// shell, so they just collapse into themselves.
+const sphere = new Float32Array(COUNT * 3);
+(function buildSphere() {
+  const GA = Math.PI * (3 - Math.sqrt(5));   // golden angle
+  for (let i = 0; i < COUNT; i++) {
+    const y = 1 - (i / (COUNT - 1)) * 2;     // +1 -> -1
+    const r = Math.sqrt(Math.max(0, 1 - y*y));
+    const th = GA * i;
+    // slight per-particle radius variation so the shell has some body
+    const rr = 1 + (Math.random() - 0.5) * 2 * ORB_JITTER;
+    sphere[i*3]   = Math.cos(th) * r * rr;
+    sphere[i*3+1] = y * rr;
+    sphere[i*3+2] = Math.sin(th) * r * rr;
+  }
+})();
+
+function seed() {
+  for (let i = 0; i < COUNT; i++) {
+    const i3 = i*3;
+    const x = (Math.random() - 0.5) * visW;
+    const y = (Math.random() - 0.5) * visH;
+    const z = (Math.random() - 0.5) * DEPTH;
+    pos[i3]=x; pos[i3+1]=y; pos[i3+2]=z;
+    home[i3]=x; home[i3+1]=y; home[i3+2]=z;
+    vel[i3]=vel[i3+1]=vel[i3+2]=0;
+    speed[i]=0;
+  }
+  geo.attributes.position.needsUpdate = true;
+  geo.attributes.aSpeed.needsUpdate  = true;
+}
+
+// stable per-particle identity — never changes, so the orb has texture even
+// when every particle is stationary and the speed ramp collapses to one colour.
+// Must be RANDOM, not index-derived: sphere targets are laid out in index
+// order, so an index-based seed would paint latitude bands on the ball.
+const seedAttr = new Float32Array(COUNT);
+for (let i = 0; i < COUNT; i++) seedAttr[i] = Math.random();
+
+const geo = new THREE.BufferGeometry();
+geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+geo.setAttribute('aSpeed',   new THREE.BufferAttribute(speed, 1));
+geo.setAttribute('aSeed',    new THREE.BufferAttribute(seedAttr, 1));
+
+const mat = new THREE.ShaderMaterial({
+  uniforms: {
+    uSize:  { value: 78.0 },
+    uPR:    { value: Math.min(devicePixelRatio, 2) },
+    uCold:  { value: new THREE.Color(0x1e3fa8) },
+    uWarm:  { value: new THREE.Color(0x27d8ff) },
+    uHot:   { value: new THREE.Color(0xf2ffff) },
+    uViolet:{ value: new THREE.Color(0x7b3fe4) },
+    uOrb:   { value: 0.0 },   // 0 = speed colouring, 1 = per-particle orb palette
+    uOrbC:  { value: new THREE.Vector3(0,0,0) },
+    uOrbR:  { value: 0.62 },
+  },
+  vertexShader: `
+    attribute float aSpeed;
+    attribute float aSeed;
+    varying float vS;
+    varying float vSeed;
+    varying float vShade;
+    uniform float uSize;
+    uniform float uPR;
+    uniform float uOrb;
+    uniform vec3  uOrbC;
+    uniform float uOrbR;
+    void main() {
+      vS = aSpeed;
+      vSeed = aSeed;
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+
+      // depth shade: particles on the far side of the orb sit back in space.
+      // Without this the additive blend fuses front and back into one blob.
+      float rel = (position.z - uOrbC.z) / max(uOrbR, 0.001);   // -1 .. +1
+      vShade = mix(1.0, clamp(0.42 + 0.58 * (rel * 0.5 + 0.5), 0.0, 1.0), uOrb);
+
+      // per-particle size variation — uniform dots read as a solid surface
+      float sizeVar = mix(1.0, 0.55 + aSeed * 0.9, uOrb);
+      gl_PointSize = clamp(uSize * uPR * sizeVar * (1.0 / max(-mv.z, 0.001)), 1.0, 6.0 * uPR);
+      gl_Position = projectionMatrix * mv;
+    }
+  `,
+  fragmentShader: `
+    varying float vS;
+    varying float vSeed;
+    varying float vShade;
+    uniform vec3 uCold;
+    uniform vec3 uWarm;
+    uniform vec3 uHot;
+    uniform vec3 uViolet;
+    uniform float uOrb;
+    void main() {
+      vec2 c = gl_PointCoord - vec2(0.5);
+      float d = length(c);
+      if (d > 0.5) discard;
+      float core = 1.0 - smoothstep(0.30, 0.46, d);
+
+      // motion colouring: cold -> cyan -> white by speed
+      float t = clamp(vS, 0.0, 1.0);
+      vec3 moving = t < 0.5
+        ? mix(uCold, uWarm, t * 2.0)
+        : mix(uWarm, uHot, (t - 0.5) * 2.0);
+
+      // orb colouring: each particle keeps its OWN place on the ramp, so a
+      // stationary sphere still shows gradient instead of one flat colour
+      float s = vSeed;
+      vec3 orbCol;
+      if (s < 0.45)      orbCol = mix(uViolet, uCold, s / 0.45);
+      else if (s < 0.82) orbCol = mix(uCold,   uWarm, (s - 0.45) / 0.37);
+      else               orbCol = mix(uWarm,   uHot,  (s - 0.82) / 0.18);
+
+      vec3 col = mix(moving, orbCol, uOrb) * vShade;
+
+      // sparse bright specks give the shell some sparkle
+      float spark = step(0.972, s) * uOrb;
+      col += spark * 0.7;
+
+      float a = core * mix(0.85, 0.62 + s * 0.5, uOrb);
+      gl_FragColor = vec4(col, a);
+    }
+  `,
+  transparent: true,
+  blending: THREE.AdditiveBlending,
+  depthWrite: false,
+  depthTest: false,
+});
+
+scene.add(new THREE.Points(geo, mat));
+seed();
+elCount.textContent = COUNT.toLocaleString();
+
+/* ─────────────────────────── hand state ─────────────────────────── */
+let landmarker = null;
+let handPresent = false;
+let gesture = 'IDLE';
+let pending = 'IDLE', pendingFrames = 0;
+
+const handPos  = { x:0, y:0, z:0 };   // palm centre, world space
+const handVel  = { x:0, y:0, z:0 };   // smoothed palm velocity
+const prevHand = { x:0, y:0, z:0 };
+let havePrev = false;
+const orb = { x:0, y:0, z:0 };
+
+// live (lerped) force params
+const P = { ...PARAMS.IDLE };
+
+function toWorld(lm) {
+  return {
+    x: ((1 - lm.x) - 0.5) * visW,   // mirrored — selfie cam
+    y: (0.5 - lm.y) * visH,
+    z: -lm.z * visH * 0.6,
+  };
+}
+
+// per-finger extension memory, so hysteresis is stateful per digit
+const extState = [false, false, false, false];
+let pinchState = false;
+
+// release burst state
+const burst = { t: 0, x: 0, y: 0, z: 0, power: 0 };
+let orbAngle = 0;   // sphere spin accumulator
+let frozen = false; // true while a fist is holding the field
+
+function fireBurst(from) {
+  // expand outward from wherever the particles were being held
+  if (from === 'PINCH') {
+    burst.x = orb.x; burst.y = orb.y; burst.z = orb.z;
+    burst.power = BURST_PINCH;
+  } else {
+    burst.x = handPos.x; burst.y = handPos.y; burst.z = handPos.z;
+    burst.power = BURST_FIST;
+  }
+  burst.t = BURST_TIME;
+}
+
+// live metrics, surfaced in the debug HUD so thresholds can be tuned by eye
+const dbg = { pinchD:0, idx:0, thumb:0, ext:[0,0,0,0], count:0, raw:null };
+
+// ── calibration ─────────────────────────────────────────────────
+// Records real measurements of the user's three poses, then derives
+// thresholds by splitting the observed gap between them. Persisted.
+const CAL_STEPS = [
+  { key:'OPEN',  label:'OPEN HAND',   hint:'spread all five fingers wide' },
+  { key:'FIST',  label:'CLOSED FIST', hint:'curl every finger in tight'   },
+  { key:'PINCH', label:'PINCH',       hint:'thumb + index tips touching, other fingers relaxed' },
+];
+const CAL_HOLD    = 1.0;   // seconds of steady tracking before sampling starts
+const CAL_SAMPLES = 45;    // frames collected per pose
+
+const cal = {
+  active: false, step: 0, hold: 0, buf: [], data: {}, done: false,
+};
+
+function calStart() {
+  cal.active = true; cal.step = 0; cal.hold = 0; cal.buf = []; cal.data = {}; cal.done = false;
+  elCal.classList.add('on');
+}
+
+function calAbort() {
+  cal.active = false;
+  elCal.classList.remove('on');
+}
+
+function calTick(dt) {
+  const step = CAL_STEPS[cal.step];
+
+  if (!handPresent || !dbg.raw) {
+    cal.hold = 0; cal.buf = [];
+    elCalTitle.textContent = 'SHOW YOUR HAND';
+    elCalHint.textContent  = 'waiting for tracking…';
+    elCalBar.style.width = '0%';
+    return;
+  }
+
+  elCalTitle.textContent = step.label;
+
+  if (cal.hold < CAL_HOLD) {
+    cal.hold += dt;
+    elCalHint.textContent = `${step.hint} — hold steady`;
+    elCalBar.style.width = `${(cal.hold / CAL_HOLD) * 100 * 0.25}%`;
+    return;
+  }
+
+  cal.buf.push({ ...dbg.raw });
+  const pct = 25 + (cal.buf.length / CAL_SAMPLES) * 75;
+  elCalBar.style.width = `${Math.min(pct, 100)}%`;
+  elCalHint.textContent = `capturing… ${cal.buf.length}/${CAL_SAMPLES}`;
+
+  if (cal.buf.length >= CAL_SAMPLES) {
+    // median is robust to the occasional bad tracking frame
+    const med = k => {
+      const v = cal.buf.map(s => s[k]).sort((a,b) => a-b);
+      return v[Math.floor(v.length/2)];
+    };
+    cal.data[step.key] = {
+      pinchD: med('pinchD'), idx: med('idx'), thumb: med('thumb'),
+      ext: [med('e0'), med('e1'), med('e2'), med('e3')],
+      extMean: (med('e0') + med('e1') + med('e2') + med('e3')) / 4,
+    };
+    cal.buf = []; cal.hold = 0; cal.step++;
+
+    if (cal.step >= CAL_STEPS.length) { calFinish(); }
+  }
+}
+
+function calFinish() {
+  const O = cal.data.OPEN, F = cal.data.FIST, P = cal.data.PINCH;
+
+  // ── validate the poses are actually DIFFERENT before trusting them.
+  // If someone holds the same shape three times (or tracking was bad), the
+  // derived thresholds are noise. Better to keep defaults and say so.
+  const extGap   = O.extMean - F.extMean;      // open fingers vs curled
+  const pinchGap = F.pinchD  - P.pinchD;       // fist gap vs pinch gap
+  const problems = [];
+  if (extGap   < 0.25) problems.push(`open/fist too similar (gap ${extGap.toFixed(2)})`);
+  if (pinchGap < 0.10) problems.push(`pinch/fist too similar (gap ${pinchGap.toFixed(2)})`);
+
+  if (problems.length) {
+    console.warn('calibration rejected:', problems.join('; '));
+    console.warn('measured:', JSON.parse(JSON.stringify(cal.data)));
+    cal.active = false;
+    elCal.classList.remove('on');
+    flashMsg = 'calibration failed — poses too similar, press C to retry';
+    flashT = 4.0;
+    return;
+  }
+
+  // Extension threshold: split the measured gap between open and fist.
+  // Weighted toward the fist side (0.45) so partially-curled reads as closed.
+  const mid  = F.extMean + extGap * 0.45;
+  const band = Math.max(extGap * 0.12, 0.05);   // hysteresis half-width
+
+  // Pinch gap: above the measured pinch, below a fist's thumb-index gap.
+  const pIn  = P.pinchD + Math.max(pinchGap * 0.4,  0.06);
+  const pOut = pIn      + Math.max(pinchGap * 0.35, 0.10);
+
+  // Pinch gates: index/thumb must reach further out than they do in a fist.
+  const idxGate   = F.idx   + (P.idx   - F.idx)   * 0.45;
+  const thumbGate = F.thumb + (P.thumb - F.thumb) * 0.45;
+
+  TH.EXT_IN      = +(mid + band).toFixed(3);
+  TH.EXT_OUT     = +(mid - band).toFixed(3);
+  TH.PINCH_IN    = +pIn.toFixed(3);
+  TH.PINCH_OUT   = +pOut.toFixed(3);
+  TH.PINCH_IDX   = +idxGate.toFixed(3);
+  TH.PINCH_THUMB = +thumbGate.toFixed(3);
+
+  try { localStorage.setItem(CAL_KEY, JSON.stringify(TH)); } catch (e) {}
+
+  console.log('=== AURAFIELD calibration ===');
+  console.log('measured:', JSON.parse(JSON.stringify(cal.data)));
+  console.log(`separation — ext gap ${extGap.toFixed(2)}, pinch gap ${pinchGap.toFixed(2)}`);
+  console.log('thresholds:', JSON.parse(JSON.stringify(TH)));
+
+  cal.active = false; cal.done = true;
+  elCal.classList.remove('on');
+  flashMsg = 'calibrated — thresholds saved'; flashT = 2.5;
+
+  // reset classifier memory so nothing carries over
+  extState[0]=extState[1]=extState[2]=extState[3]=false;
+  pinchState = false; gesture = 'IDLE'; pendingFrames = 0;
+}
+
+function calLoad() {
+  try {
+    const raw = localStorage.getItem(CAL_KEY);
+    if (!raw) return false;
+    const saved = JSON.parse(raw);
+    for (const k in TH) if (typeof saved[k] === 'number') TH[k] = saved[k];
+    console.log('loaded saved calibration:', saved);
+    return true;
+  } catch (e) { return false; }
+}
+
+window.AF_TH = TH;
+window.AF_RECAL = calStart;
+
+// ── rolling diagnostic buffer ────────────────────────────────────
+// Keeps the last ~8s of classifier metrics so a session can be inspected
+// after the fact instead of hoping to catch the right frame in a poll.
+const LOG_MAX = 480;
+const afLog = [];
+window.AF_LOG = afLog;
+window.AF_LOG_CLEAR = () => { afLog.length = 0; return 'cleared'; };
+
+function logFrame() {
+  if (!dbg.raw) return;
+  afLog.push({
+    t: +(performance.now()/1000).toFixed(2),
+    g: gesture,
+    pd: +dbg.raw.pinchD.toFixed(3),
+    ix: +dbg.raw.idx.toFixed(3),
+    th: +dbg.raw.thumb.toFixed(3),
+    e:  [dbg.raw.e0, dbg.raw.e1, dbg.raw.e2, dbg.raw.e3].map(v => +v.toFixed(3)),
+    n:  dbg.count,
+    ps: pinchState ? 1 : 0,
+  });
+  if (afLog.length > LOG_MAX) afLog.shift();
+}
+
+// summarize what was recorded, split by what the classifier decided
+window.AF_STATS = function () {
+  if (!afLog.length) return JSON.stringify({ error: 'no frames recorded' });
+  const q = (arr, p) => {
+    const v = [...arr].sort((a,b)=>a-b);
+    return +v[Math.floor(v.length * p)].toFixed(3);
+  };
+  const groups = {};
+  for (const r of afLog) (groups[r.g] = groups[r.g] || []).push(r);
+  const out = { frames: afLog.length, thresholds: TH, byGesture: {} };
+  for (const g in groups) {
+    const rs = groups[g];
+    const extAll = rs.flatMap(r => r.e);
+    out.byGesture[g] = {
+      frames: rs.length,
+      extMean_p50: q(rs.map(r => (r.e[0]+r.e[1]+r.e[2]+r.e[3])/4), 0.5),
+      ext_p10: q(extAll, 0.10), ext_p50: q(extAll, 0.5), ext_p90: q(extAll, 0.90),
+      perFinger_p50: [0,1,2,3].map(i => q(rs.map(r => r.e[i]), 0.5)),
+      pinchD_p50: q(rs.map(r => r.pd), 0.5),
+      idx_p50:    q(rs.map(r => r.ix), 0.5),
+      thumb_p50:  q(rs.map(r => r.th), 0.5),
+      extCount_p50: q(rs.map(r => r.n), 0.5),
+    };
+  }
+  return JSON.stringify(out);
+};
+
+function d3(a, b, scale) {
+  const dz = (a.z - b.z) * Z_WEIGHT;
+  return Math.hypot(a.x - b.x, a.y - b.y, dz) / scale;
+}
+
+function classify(lm) {
+  // rigid-bone ruler: wrist -> middle MCP
+  const scale = Math.hypot(
+    lm[0].x - lm[9].x, lm[0].y - lm[9].y, (lm[0].z - lm[9].z) * Z_WEIGHT
+  ) || 1e-4;
+
+  // palm centre — curl reads much cleaner from here than from the wrist,
+  // because a curled fingertip lands ON the palm, not near the wrist.
+  const palm = { x:0, y:0, z:0 };
+  for (const i of [0,5,9,13,17]) { palm.x += lm[i].x; palm.y += lm[i].y; palm.z += lm[i].z; }
+  palm.x /= 5; palm.y /= 5; palm.z /= 5;
+
+  // ── finger extension, measured from the palm (rotation-invariant)
+  const tips = [8, 12, 16, 20];
+  let extCount = 0;
+  for (let i = 0; i < 4; i++) {
+    const d = d3(lm[tips[i]], palm, scale);
+    dbg.ext[i] = d;
+    extState[i] = extState[i] ? (d > TH.EXT_OUT) : (d > TH.EXT_IN);
+    if (extState[i]) extCount++;
+  }
+
+  // ── pinch needs THREE things true at once, not just a small gap.
+  // A closed fist also puts the thumb tip right next to the index — that
+  // was the whole bug. Requiring both digits to be reaching OUT of the
+  // palm is what makes fist and pinch separable.
+  const pinchD  = d3(lm[4], lm[8],  scale);   // thumb tip <-> index tip
+  const idxOut  = d3(lm[8], palm,   scale);   // index reaching away?
+  const thumbOut= d3(lm[4], palm,   scale);   // thumb reaching away?
+  dbg.pinchD = pinchD; dbg.idx = idxOut; dbg.thumb = thumbOut; dbg.count = extCount;
+  dbg.raw = { pinchD, idx:idxOut, thumb:thumbOut,
+              e0:dbg.ext[0], e1:dbg.ext[1], e2:dbg.ext[2], e3:dbg.ext[3] };
+
+  // ── FIST is checked FIRST and wins outright.
+  // Measured fist: every finger ~0.16 from the palm, index 0.28, thumb 0.26.
+  // A curled hand is unambiguous — nothing else looks like it — so there is
+  // no reason to let a small thumb-index gap (fists have one, ~0.26) steal
+  // the frame for PINCH. Checking pinch first was the bug.
+  if (extCount === 0) return 'FIST';
+
+  // ── pinch: index curled toward the thumb while the OTHER fingers stay out.
+  // Measured pinch: index 0.53 (in), middle 1.13 / ring 1.06 / pinky 0.86 (out).
+  // That "index in, rest out" signature is what separates it from a fist,
+  // where everything is in, and from an open hand, where everything is out.
+  const othersOut = (extState[1] ? 1 : 0) + (extState[2] ? 1 : 0) + (extState[3] ? 1 : 0);
+  const gateOK = idxOut   > TH.PINCH_IDX
+              && thumbOut > TH.PINCH_THUMB
+              && othersOut >= 2;
+  pinchState = gateOK && (pinchState ? (pinchD < TH.PINCH_OUT) : (pinchD < TH.PINCH_IN));
+
+  if (pinchState) return 'PINCH';
+  if (extCount >= 3) return 'OPEN';
+  if (extCount <= 1) return 'FIST';
+  return gesture;   // 2 fingers: ambiguous, hold whatever we had
+}
+
+const BONES = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],
+  [13,17],[17,18],[18,19],[19,20],[0,17],
+];
+
+function drawSkeleton(lm) {
+  const W = overlay.width, H = overlay.height;
+  const px = i => (1 - lm[i].x) * W;
+  const py = i =>      lm[i].y  * H;
+
+  octx.lineWidth = 2;
+  octx.strokeStyle = 'rgba(120, 225, 255, 0.55)';
+  octx.beginPath();
+  for (const [a,b] of BONES) { octx.moveTo(px(a), py(a)); octx.lineTo(px(b), py(b)); }
+  octx.stroke();
+
+  octx.fillStyle = 'rgba(200, 245, 255, 0.9)';
+  for (let i = 0; i < 21; i++) {
+    octx.beginPath();
+    octx.arc(px(i), py(i), i === 4 || i === 8 ? 5 : 3, 0, Math.PI*2);
+    octx.fill();
+  }
+  if (gesture === 'PINCH') {
+    // line between the pinched tips — the sphere's anchor
+    octx.strokeStyle = 'rgba(255,255,255,0.95)';
+    octx.lineWidth = 3;
+    octx.beginPath(); octx.moveTo(px(4),py(4)); octx.lineTo(px(8),py(8)); octx.stroke();
+    const cx = (px(4)+px(8))/2, cy = (py(4)+py(8))/2;
+    octx.strokeStyle = 'rgba(120,225,255,0.7)';
+    octx.lineWidth = 2;
+    octx.beginPath(); octx.arc(cx, cy, 30, 0, Math.PI*2); octx.stroke();
+  }
+  if (gesture === 'FIST') {
+    // bracket corners at the palm — freeze-frame marker
+    let cx = 0, cy = 0;
+    for (const i of [0,5,9,13,17]) { cx += px(i); cy += py(i); }
+    cx /= 5; cy /= 5;
+    const s = 30, L = 10;
+    octx.strokeStyle = 'rgba(255,255,255,0.9)';
+    octx.lineWidth = 2.5;
+    octx.beginPath();
+    for (const [ox, oy] of [[-1,-1],[1,-1],[-1,1],[1,1]]) {
+      const x = cx + ox*s, y = cy + oy*s;
+      octx.moveTo(x, y); octx.lineTo(x - ox*L, y);
+      octx.moveTo(x, y); octx.lineTo(x, y - oy*L);
+    }
+    octx.stroke();
+  }
+}
+
+/* ─────────────────────────── physics ─────────────────────────── */
+function step(dt, t) {
+  // FREEZE — a true hold. Velocities are zeroed and positions are not
+  // integrated at all, so the field stops on the exact frame you closed
+  // your fist. Damping alone can't do this: it decays toward zero over
+  // time, which reads as "sliding to a stop", not "freeze frame".
+  if (P.freeze) {
+    if (!frozen) {
+      vel.fill(0);          // kill momentum once, on entry
+      speed.fill(0);        // and drop the speed-based glow to cold
+      geo.attributes.aSpeed.needsUpdate = true;
+      frozen = true;
+    }
+    return;                 // no integration — positions are held exactly
+  }
+  frozen = false;
+
+  const hf   = P.handForce;
+  const of   = P.orbForce;
+  const nz   = P.noise;
+  const hp   = P.homePull;
+
+  const hx = handPos.x, hy = handPos.y, hz = handPos.z;
+  const vx0 = handVel.x, vy0 = handVel.y, vz0 = handVel.z;
+  const R2 = HAND_RADIUS * HAND_RADIUS;
+
+  // release burst — front-loaded impulse that decays over BURST_TIME
+  let bf = 0, bx = 0, by = 0, bz = 0;
+  let damp = Math.pow(P.damping, dt * 60);
+  if (burst.t > 0) {
+    const k = burst.t / BURST_TIME;        // 1 -> 0
+    bf = burst.power * k * k;              // quadratic: sharp hit, quick falloff
+    bx = burst.x; by = burst.y; bz = burst.z;
+    // let the shockwave actually travel — ease damping back in as it decays
+    damp = Math.pow(THREE.MathUtils.lerp(P.damping, 0.995, k), dt * 60);
+    burst.t -= dt;
+    if (burst.t < 0) burst.t = 0;
+  }
+
+  const halfW = visW * 0.62, halfH = visH * 0.62, halfD = DEPTH * 1.2;
+
+  // advance sphere rotation only while it's actually forming
+  if (of > 0.5) orbAngle += ORB_SPIN * dt;
+  const orbCos = Math.cos(orbAngle), orbSin = Math.sin(orbAngle);
+
+  for (let i = 0; i < COUNT; i++) {
+    const i3 = i*3;
+    let px = pos[i3], py = pos[i3+1], pz = pos[i3+2];
+    let vx = vel[i3], vy = vel[i3+1], vz = vel[i3+2];
+
+    // ambient organic drift
+    if (nz > 0) {
+      const s = 0.9;
+      vx += Math.sin(py*s + t*0.7) * nz * dt;
+      vy += Math.cos(px*s - t*0.6) * nz * dt;
+      vz += Math.sin((px+py)*s*0.5 + t*0.4) * nz * 0.5 * dt;
+    }
+
+    // OPEN — advect along palm velocity, falloff with distance
+    if (hf > 0) {
+      const dx = px-hx, dy = py-hy, dz = pz-hz;
+      const d2 = dx*dx + dy*dy + dz*dz;
+      const fall = 1 / (1 + d2/R2);
+      const k = hf * fall * dt;
+      vx += vx0 * k; vy += vy0 * k; vz += vz0 * k;
+    }
+
+    // SPHERE — spring each particle to its OWN assigned point on the shell.
+    // The whole target set rotates, so the sphere spins as a rigid body.
+    if (of > 0) {
+      const sx = sphere[i3], sy = sphere[i3+1], sz = sphere[i3+2];
+      // rotate the target around Y by orbAngle
+      const tx = sx * orbCos - sz * orbSin;
+      const tz = sx * orbSin + sz * orbCos;
+      const gx = orb.x + tx * ORB_RADIUS;
+      const gy = orb.y + sy * ORB_RADIUS;
+      const gz = orb.z + tz * ORB_RADIUS;
+      vx += (gx - px) * of * dt;
+      vy += (gy - py) * of * dt;
+      vz += (gz - pz) * of * dt;
+    }
+
+    // RELEASE BURST — radial shockwave outward from the hold point
+    if (bf > 0) {
+      const dx = px-bx, dy = py-by, dz = pz-bz;
+      const d = Math.sqrt(dx*dx + dy*dy + dz*dz) || 1e-5;
+      const fall = 1 / (1 + (d*d)/(BURST_R*BURST_R));
+      const imp = bf * fall * dt;
+      vx += (dx/d)*imp; vy += (dy/d)*imp; vz += (dz/d)*imp;
+    }
+
+    // IDLE — ease back to the rest lattice
+    if (hp > 0) {
+      vx += (home[i3]   - px) * hp * dt;
+      vy += (home[i3+1] - py) * hp * dt;
+      vz += (home[i3+2] - pz) * hp * dt;
+    }
+
+    // soft containment (no wrap — wrapping pops with trails on)
+    if (px >  halfW) vx -= (px-halfW) * 3.0 * dt;
+    if (px < -halfW) vx -= (px+halfW) * 3.0 * dt;
+    if (py >  halfH) vy -= (py-halfH) * 3.0 * dt;
+    if (py < -halfH) vy -= (py+halfH) * 3.0 * dt;
+    if (pz >  halfD) vz -= (pz-halfD) * 3.0 * dt;
+    if (pz < -halfD) vz -= (pz+halfD) * 3.0 * dt;
+
+    vx *= damp; vy *= damp; vz *= damp;
+    px += vx*dt; py += vy*dt; pz += vz*dt;
+
+    pos[i3]=px; pos[i3+1]=py; pos[i3+2]=pz;
+    vel[i3]=vx; vel[i3+1]=vy; vel[i3+2]=vz;
+    speed[i] = Math.sqrt(vx*vx + vy*vy + vz*vz) * 0.42;
+  }
+
+  geo.attributes.position.needsUpdate = true;
+  geo.attributes.aSpeed.needsUpdate   = true;
+}
+
+/* ─────────────────────────── boot ─────────────────────────── */
+async function initCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { width:{ideal:1280}, height:{ideal:720}, facingMode:'user' }, audio:false
+  });
+  video.srcObject = stream;
+  await new Promise(r => video.onloadedmetadata = r);
+  await video.play();
+  console.log(`Camera ready: ${video.videoWidth}x${video.videoHeight}`);
+}
+
+async function initHands() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm'
+  );
+  landmarker = await HandLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task',
+      delegate: 'GPU',
+    },
+    numHands: 1,
+    runningMode: 'VIDEO',
+    minHandDetectionConfidence: 0.5,
+    minHandPresenceConfidence: 0.5,
+    minTrackingConfidence: 0.5,
+  });
+  console.log('HandLandmarker loaded');
+}
+
+/* ─────────────────────────── loop ─────────────────────────── */
+let last = performance.now(), lastVideoTime = -1;
+let paused = false, showSkeleton = true, showDbg = false;
+let flashMsg = '', flashT = 0;
+let frames = 0, fpsTimer = 0;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+
+  let dt = (now - last) / 1000;
+  last = now;
+  if (dt > 1/30) dt = 1/30;
+  if (paused) return;
+  const t = now / 1000;
+
+  // ── hand tracking
+  if (landmarker && video.readyState >= 2 && video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    let res = null;
+    try { res = landmarker.detectForVideo(video, now); } catch (e) { /* transient */ }
+
+    octx.clearRect(0, 0, overlay.width, overlay.height);
+
+    if (res && res.landmarks && res.landmarks.length > 0) {
+      const lm = res.landmarks[0];
+      handPresent = true;
+
+      // palm centre = mean of wrist + finger MCPs
+      const ids = [0,5,9,13,17];
+      let sx=0, sy=0, sz=0;
+      for (const i of ids) { const w = toWorld(lm[i]); sx+=w.x; sy+=w.y; sz+=w.z; }
+      handPos.x = sx/ids.length; handPos.y = sy/ids.length; handPos.z = sz/ids.length;
+
+      if (havePrev && dt > 0) {
+        const nvx = (handPos.x - prevHand.x)/dt;
+        const nvy = (handPos.y - prevHand.y)/dt;
+        const nvz = (handPos.z - prevHand.z)/dt;
+        handVel.x += (nvx - handVel.x) * 0.35;   // smooth the jitter out
+        handVel.y += (nvy - handVel.y) * 0.35;
+        handVel.z += (nvz - handVel.z) * 0.35;
+      }
+      prevHand.x = handPos.x; prevHand.y = handPos.y; prevHand.z = handPos.z;
+      havePrev = true;
+
+      // sphere forms between the pinched fingertips — smoothed so the
+      // whole ball doesn't jitter with per-frame landmark noise
+      const tip4 = toWorld(lm[4]), tip8 = toWorld(lm[8]);
+      const mx = (tip4.x + tip8.x)/2, my = (tip4.y + tip8.y)/2, mz = (tip4.z + tip8.z)/2;
+      orb.x += (mx - orb.x) * 0.25;
+      orb.y += (my - orb.y) * 0.25;
+      orb.z += (mz - orb.z) * 0.25;
+
+      // debounced state switch — per-gesture frame requirement
+      const g = classify(lm);
+      if (g === gesture) { pendingFrames = 0; }
+      else if (g === pending) {
+        if (++pendingFrames >= (DEBOUNCE[g] || 3)) {
+          // release: held state -> open hand throws the particles outward
+          if (g === 'OPEN' && (gesture === 'FIST' || gesture === 'PINCH')) {
+            fireBurst(gesture);
+          }
+          gesture = g; pendingFrames = 0;
+        }
+      }
+      else { pending = g; pendingFrames = 1; }
+
+      if (showSkeleton) drawSkeleton(lm);
+      logFrame();
+    } else {
+      handPresent = false;
+      havePrev = false;
+      handVel.x = handVel.y = handVel.z = 0;
+      gesture = 'IDLE';
+      // clear hysteresis memory so a returning hand starts clean
+      extState[0] = extState[1] = extState[2] = extState[3] = false;
+      pinchState = false;
+      pendingFrames = 0;
+    }
+  }
+
+  // ── calibration takes over the gesture pipeline while it runs
+  if (cal.active) {
+    elCalStep.textContent = `CALIBRATION ${Math.min(cal.step+1, CAL_STEPS.length)} / ${CAL_STEPS.length}`;
+    calTick(dt);
+    gesture = 'IDLE';
+  }
+
+  // ── ease force params toward the active gesture (no hard switches)
+  const T = PARAMS[gesture];
+  const k = 1 - Math.pow(0.001, dt);   // ~0.15s time constant
+  for (const key in T) {
+    if (key === 'freeze') continue;    // boolean — must not lerp
+    P[key] += (T[key] - P[key]) * k;
+  }
+  P.freeze = T.freeze;                 // instant, so the hold is exact
+
+  step(dt, t);
+
+  // orb colouring ramps in with the sphere force, so the palette shift
+  // arrives as the ball forms rather than snapping on at the gesture switch
+  mat.uniforms.uOrb.value = Math.min(P.orbForce / 26.0, 1.0);
+  mat.uniforms.uOrbC.value.set(orb.x, orb.y, orb.z);
+  mat.uniforms.uOrbR.value = ORB_RADIUS;
+
+  // ── render: fade quad first, then additive points.
+  // While frozen we skip the fade — otherwise the trail buffer would keep
+  // dimming the held field toward black instead of holding the frame.
+  if (!P.freeze) renderer.render(fadeScene, fadeCam);
+  else renderer.clear();
+  renderer.render(scene, camera);
+
+  // ── hud
+  frames++; fpsTimer += dt;
+  if (fpsTimer >= 0.5) {
+    elFps.textContent = Math.round(frames / fpsTimer);
+    frames = 0; fpsTimer = 0;
+  }
+  elHand.textContent = handPresent ? 'tracked' : 'searching…';
+  elGest.textContent = gesture === 'IDLE' ? '—' : gesture;
+  if (flashT > 0) {
+    flashT -= dt;
+    elDesc.textContent = flashMsg;
+  } else {
+    elDesc.textContent = burst.t > 0 ? 'RELEASE — bursting outward' : DESC[gesture];
+  }
+
+  if (showDbg) {
+    const f = n => n.toFixed(2).padStart(5);
+    const mark = (v, t) => v > t
+      ? `<span class="hi">${f(v)}</span>` : `<span class="lo">${f(v)}</span>`;
+    elDbg.innerHTML =
+      `pinch gap ${f(dbg.pinchD)}  (in<${TH.PINCH_IN} out<${TH.PINCH_OUT})\n` +
+      `index out ${mark(dbg.idx,   TH.PINCH_IDX)}  (gate >${TH.PINCH_IDX})\n` +
+      `thumb out ${mark(dbg.thumb, TH.PINCH_THUMB)}  (gate >${TH.PINCH_THUMB})\n` +
+      `ext i/m/r/p ${dbg.ext.map(v=>v.toFixed(2)).join(' ')}  (in>${TH.EXT_IN})\n` +
+      `extended  ${dbg.count}   pinchState ${pinchState ? 'Y' : 'n'}`;
+  }
+}
+
+/* ─────────────────────────── events ─────────────────────────── */
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w/h;
+  camera.updateProjectionMatrix();
+  visH = 2 * camera.position.z * Math.tan(THREE.MathUtils.degToRad(30));
+  visW = visH * camera.aspect;
+  overlay.width = w; overlay.height = h;
+}
+addEventListener('resize', resize);
+
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'h') document.getElementById('af-hud').classList.toggle('hidden');
+  if (k === 'v') video.classList.toggle('hidden');
+  if (k === 's') { showSkeleton = !showSkeleton; octx.clearRect(0,0,overlay.width,overlay.height); }
+  if (k === 'r') seed();
+  if (k === 'd') { showDbg = !showDbg; elDbg.classList.toggle('on', showDbg); }
+  if (k === 'c') calStart();
+  if (k === 'x') {
+    for (const key in TH_DEFAULTS) TH[key] = TH_DEFAULTS[key];
+    try { localStorage.removeItem(CAL_KEY); } catch (e) {}
+    extState[0]=extState[1]=extState[2]=extState[3]=false;
+    pinchState = false; gesture = 'IDLE'; pendingFrames = 0;
+    console.log('calibration reset to measured defaults:', TH);
+    flashMsg = 'calibration reset to defaults'; flashT = 2.0;
+  }
+  if (e.key === 'Escape' && cal.active) calAbort();
+  if (e.code === 'Space') { e.preventDefault(); paused = !paused; last = performance.now(); }
+});
+
+/* ─────────────────────────── go ─────────────────────────── */
+(async () => {
+  try {
+    resize();
+    bootmsg.textContent = 'requesting camera…';
+    await initCamera();
+    bootmsg.textContent = 'loading hand model…';
+    await initHands();
+    boot.classList.add('gone');
+    // defaults are measured from real hand data, so calibration is now an
+    // opt-in refinement (press C) rather than a forced first-run gate
+    calLoad();
+    requestAnimationFrame(frame);
+  } catch (err) {
+    console.error(err);
+    bootmsg.textContent = 'failed to start';
+    booterr.textContent =
+      err.name === 'NotAllowedError'
+        ? 'Camera permission denied. Allow it in Chrome (the icon in the address bar), and check System Settings → Privacy & Security → Camera → Google Chrome.'
+        : `${err.name}: ${err.message}`;
+  }
+})();
+</script>
+</body>
+</html>
