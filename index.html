@@ -21,6 +21,18 @@
   }
   #af-cam.hidden { display:none; }
 
+  /* Camera as a full-screen backdrop. Sits BEHIND the WebGL canvas (which
+     becomes transparent in this mode). Dimmed hard — raw webcam at full
+     brightness washes the particles out completely. */
+  #af-cam.bg {
+    right:auto; bottom:auto; inset:0;
+    width:100%; height:100%; border-radius:0;
+    object-fit:cover; z-index:0;
+    border:none; box-shadow:none;
+    filter: brightness(var(--cam-bright, 0.42)) saturate(0.68) contrast(1.05);
+  }
+  #af-cam.bg.hidden { display:block; }   /* bg mode overrides the thumb toggle */
+
   #af-hud {
     position:fixed; left:18px; top:16px; z-index:5;
     font-size:12px; line-height:1.65; letter-spacing:0.04em;
@@ -192,9 +204,9 @@
 </div>
 
 <div id="af-keys">
-  <kbd>H</kbd> hud &nbsp; <kbd>V</kbd> camera &nbsp; <kbd>S</kbd> skeleton &nbsp;
-  <kbd>P</kbd> colour &nbsp; <kbd>D</kbd> debug &nbsp; <kbd>R</kbd> reset &nbsp;
-  <kbd>Space</kbd> pause<br>
+  <kbd>H</kbd> hud &nbsp; <kbd>B</kbd> background &nbsp; <kbd>V</kbd> camera &nbsp;
+  <kbd>S</kbd> skeleton &nbsp; <kbd>P</kbd> colour &nbsp; <kbd>D</kbd> debug &nbsp;
+  <kbd>R</kbd> reset &nbsp; <kbd>Space</kbd> pause<br>
   <kbd>C</kbd> recalibrate &nbsp; <kbd>X</kbd> reset calibration
 </div>
 
@@ -399,10 +411,11 @@ const elCalBar   = document.getElementById('af-cal-bar');
 const elCalStep  = document.getElementById('af-cal-step');
 
 /* ─────────────────────────── three ─────────────────────────── */
-const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias:false, alpha:false });
+const renderer = new THREE.WebGLRenderer({ canvas: glCanvas, antialias:false, alpha:true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.autoClear = false;
+renderer.setClearColor(0x000000, 0);   // transparent — body/video shows through
 
 const scene  = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 100);
@@ -413,12 +426,23 @@ let visH = 2 * 5 * Math.tan(THREE.MathUtils.degToRad(30));
 let visW = visH * (innerWidth/innerHeight);
 const DEPTH = 1.8;
 
-// trail fade quad
+// Trail fade quad.
+// Uses CustomBlending (src=ZERO, dst=ONE_MINUS_SRC_ALPHA) rather than a plain
+// translucent black quad. The RGB result is identical — dst.rgb * (1-FADE) —
+// but this ALSO decays the alpha channel. That matters in camera-background
+// mode: with normal blending the quad would leave an opaque black film over
+// the video. Verified the RGB math matches, so the black-background look is
+// unchanged and this can stay on unconditionally.
 const fadeScene = new THREE.Scene();
 const fadeCam   = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
 fadeScene.add(new THREE.Mesh(
   new THREE.PlaneGeometry(2,2),
-  new THREE.MeshBasicMaterial({ color:0x000000, transparent:true, opacity:FADE, depthTest:false })
+  new THREE.MeshBasicMaterial({
+    color:0x000000, transparent:true, opacity:FADE, depthTest:false,
+    blending: THREE.CustomBlending,
+    blendSrc: THREE.ZeroFactor,
+    blendDst: THREE.OneMinusSrcAlphaFactor,
+  })
 ));
 
 /* ─────────────────────────── particles ─────────────────────────── */
@@ -527,6 +551,9 @@ const mat = new THREE.ShaderMaterial({
     uDiskV:  { value: new THREE.Vector3(0,0,1) },
     uDiskIn: { value: 0.30 },
     uDiskOut:{ value: 1.75 },
+    // brightness multiplier — raised in camera-background mode so particles
+    // stay readable against a lit backdrop instead of pure black
+    uGain:   { value: 1.0 },
   },
   vertexShader: `
     attribute float aSpeed;
@@ -621,6 +648,7 @@ const mat = new THREE.ShaderMaterial({
     uniform float uDens;
     uniform float uSpectrum;
     uniform float uDisk;
+    uniform float uGain;
 
     vec3 hsv2rgb(vec3 c) {
       vec4 K = vec4(1.0, 2.0/3.0, 1.0/3.0, 3.0);
@@ -702,7 +730,7 @@ const mat = new THREE.ShaderMaterial({
       // gentler than the colour ramp (0.75 vs 1.15) — stacking a steep alpha
       // boost on top of the already-crowded inner radii was reading as mush.
       a = mix(a, clamp(a * (0.55 + vDiskT * 0.75) * vDop, 0.0, 0.95), uDisk);
-      gl_FragColor = vec4(col, clamp(a, 0.0, 1.0));
+      gl_FragColor = vec4(col * uGain, clamp(a, 0.0, 1.0));
     }
   `,
   transparent: true,
@@ -1834,6 +1862,35 @@ document.getElementById('af-reset-pal').addEventListener('click', () => {
   flashMsg = 'palette reset'; flashT = 1.5;
 });
 
+/* ─────────────────────────── camera background ─────────────────────────── */
+// Two looks: particles on black (default), or particles composited over the
+// live webcam feed. B toggles; the choice persists.
+const CAMBG_KEY = 'aurafield.cambg.v1';
+let camBg = false;
+
+function setCamBg(on) {
+  camBg = !!on;
+  video.classList.toggle('bg', camBg);
+  if (camBg) video.classList.remove('hidden');
+
+  // Particles must fight a lit backdrop instead of pure black, so they get
+  // brighter and slightly larger. Without this they wash out entirely.
+  mat.uniforms.uGain.value = camBg ? 1.55 : 1.0;
+  mat.uniforms.uSize.value = camBg ? 96.0 : 78.0;
+
+  // Longer trails on video: a busy backdrop breaks up the motion streaks, so
+  // they need more persistence to still read as trails.
+  fadeScene.children[0].material.opacity = camBg ? FADE * 0.72 : FADE;
+
+  flashMsg = camBg ? 'camera background' : 'black background';
+  flashT = 1.4;
+  try { localStorage.setItem(CAMBG_KEY, camBg ? '1' : '0'); } catch (e) {}
+}
+
+function loadCamBg() {
+  try { if (localStorage.getItem(CAMBG_KEY) === '1') setCamBg(true); } catch (e) {}
+}
+
 /* ─────────────────────────── events ─────────────────────────── */
 function resize() {
   const w = innerWidth, h = innerHeight;
@@ -1849,7 +1906,13 @@ addEventListener('resize', resize);
 addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
   if (k === 'h') document.getElementById('af-hud').classList.toggle('hidden');
-  if (k === 'v') video.classList.toggle('hidden');
+  if (k === 'v') {
+    // In background mode V is meaningless (the feed IS the background), so
+    // it exits back to black rather than doing nothing.
+    if (camBg) setCamBg(false);
+    else video.classList.toggle('hidden');
+  }
+  if (k === 'b') setCamBg(!camBg);
   if (k === 's') { showSkeleton = !showSkeleton; octx.clearRect(0,0,overlay.width,overlay.height); }
   if (k === 'r') seed();
   if (k === 'd') { showDbg = !showDbg; elDbg.classList.toggle('on', showDbg); }
@@ -1881,6 +1944,7 @@ addEventListener('keydown', e => {
     calLoad();
     loadPalette();
     applyPalette(false);
+    loadCamBg();
     // the palette orb is the headline interaction now, not an opt-in extra
     gesturePick = true;
     elGpick.textContent = 'on';
