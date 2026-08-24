@@ -277,12 +277,18 @@ const ORB_SPIN    = 0.55;   // rad/sec the sphere rotates while held
 const ORB_JITTER  = 0.09;   // shell thickness — 0 = glassy, higher = fuzzy
 
 // ── accretion disk (index finger pointing) ──
-const DISK_IN     = 0.22;   // inner edge — the "event horizon" gap
-const DISK_OUT    = 1.65;   // outer edge
-const DISK_FLAT   = 9.0;    // how hard particles are pressed into the plane
-const DISK_PULL   = 7.0;    // radial spring onto the assigned orbit
-const DISK_SPIN   = 2.35;   // base orbital rate (scaled Keplerian per radius)
-const DISK_THICK  = 0.05;   // vertical scatter so it isn't a zero-height sheet
+// The disk lies in a HORIZONTAL plane (normal ≈ world up), tilted toward the
+// camera so you see it as a shallow ellipse rather than face-on. That tilt is
+// what makes it read as a black hole rather than a flat swirl.
+const DISK_IN     = 0.30;   // inner edge — the "event horizon" gap
+const DISK_OUT    = 1.75;   // outer edge
+const DISK_FLAT   = 14.0;   // how hard particles are pressed into the plane
+const DISK_PULL   = 8.0;    // radial spring onto the assigned orbit
+const DISK_SPIN   = 3.2;    // base orbital rate (scaled Keplerian per radius)
+const DISK_THICK  = 0.035;  // vertical scatter so it isn't a zero-height sheet
+const DISK_TILT   = 0.42;   // radians the plane leans toward camera (~24°)
+const DISK_WOB_A  = 0.16;   // wobble amplitude, radians
+const DISK_WOB_S  = 1.15;   // wobble speed
 const HAND_RADIUS = 1.5;    // falloff radius for open-hand advection
 const FADE        = 0.16;   // trail persistence (lower = longer trails)
 
@@ -635,6 +641,23 @@ let mPinchState = false;   // thumb + middle, colour-pick gesture
 const idxTip = { x: 0, y: 0, has: false };   // index tip in normalized 0..1 screen space
 const pinchMid = { x: 0, y: 0, has: false }; // thumb+middle midpoint — palette cursor
 const diskC = { x: 0, y: 0, z: 0 };          // accretion disk centre, world space
+// Disk plane basis: u,v span the plate; n is its normal. Starts HORIZONTAL
+// (normal = world up) then leans toward the camera and wobbles.
+const dkU = { x: 1, y: 0, z: 0 };
+const dkV = { x: 0, y: 0, z: 1 };
+const dkN = { x: 0, y: 1, z: 0 };
+
+function updateDiskBasis(t) {
+  // a = lean toward camera (rotation about X), b = side-to-side wobble (about Z)
+  const a = DISK_TILT + Math.sin(t * DISK_WOB_S) * DISK_WOB_A;
+  const b = Math.cos(t * DISK_WOB_S * 0.77) * DISK_WOB_A * 0.6;
+  const ca = Math.cos(a), sa = Math.sin(a);
+  const cb = Math.cos(b), sb = Math.sin(b);
+  // Rx(a) then Rz(b) applied to the horizontal basis
+  dkU.x = cb;        dkU.y = sb;        dkU.z = 0;
+  dkV.x = sa * sb;   dkV.y = -sa * cb;  dkV.z = ca;
+  dkN.x = -ca * sb;  dkN.y = ca * cb;   dkN.z = sa;
+}
 let gesturePick = false;                     // is hand colour-picking armed?
 const aim = { x: 0, y: 0, on: false };       // legacy panel-wheel cursor
 const pickAim = { x: 0, y: 0, on: false };   // fingertip while picking off the orb
@@ -1141,6 +1164,9 @@ function step(dt, t) {
 
   const halfW = visW * 0.62, halfH = visH * 0.62, halfD = DEPTH * 1.2;
 
+  // disk plane leans + wobbles; recomputed once per frame, not per particle
+  if (df > 0) updateDiskBasis(t);
+
   // advance sphere rotation only while it's actually forming
   if (of > 0.5) orbAngle += ORB_SPIN * dt;
   const orbCos = Math.cos(orbAngle), orbSin = Math.sin(orbAngle);
@@ -1182,30 +1208,43 @@ function step(dt, t) {
       vz += (gz - pz) * of * dt;
     }
 
-    // ACCRETION DISK — orbit the fingertip in a flat plane facing the camera.
-    // Each particle springs onto its own assigned orbit radius and rides a
-    // Keplerian-ish angular rate (inner orbits sweep faster), which is what
-    // produces the sheared, banded look rather than a rigid spinning plate.
+    // ACCRETION DISK — a HORIZONTAL plate orbiting the fingertip, tilted
+    // toward the camera so it reads as a shallow ellipse. Working in the
+    // disk's own basis (u,v span the plane; n is its normal) is what makes
+    // this a real plane in 3D rather than a flat screen-space swirl.
     if (df > 0) {
-      const px2 = px - diskC.x, py2 = py - diskC.y, pz2 = pz - diskC.z;
-      const rNow = Math.sqrt(px2*px2 + py2*py2) || 1e-5;
+      const dx0 = px - diskC.x, dy0 = py - diskC.y, dz0 = pz - diskC.z;
+
+      // decompose into in-plane (u,v) and out-of-plane (n) components
+      const pu = dx0*dkU.x + dy0*dkU.y + dz0*dkU.z;
+      const pv = dx0*dkV.x + dy0*dkV.y + dz0*dkV.z;
+      const h  = dx0*dkN.x + dy0*dkN.y + dz0*dkN.z;
+
+      const rNow = Math.sqrt(pu*pu + pv*pv) || 1e-5;
       const rTgt = diskR[i];
 
-      // angular position, advanced by radius-dependent rate
-      const ang = Math.atan2(py2, px2) + diskPh[i] * 0.0;
-      const rate = DISK_SPIN / Math.pow(rTgt, 0.62);   // faster when closer in
-      const tx = -Math.sin(ang), ty = Math.cos(ang);   // tangent
-      vx += tx * rate * df * dt * 0.55;
-      vy += ty * rate * df * dt * 0.55;
+      // orbital motion: tangent = (-sinθ)u + (cosθ)v, with θ from (pu,pv).
+      // Rate falls off with radius (Keplerian-ish) so inner rings shear past
+      // outer ones — that differential is what sells it as a disk.
+      const cs = pu / rNow, sn = pv / rNow;
+      const rate = DISK_SPIN / Math.pow(rTgt, 0.62);
+      const tanX = -sn*dkU.x + cs*dkV.x;
+      const tanY = -sn*dkU.y + cs*dkV.y;
+      const tanZ = -sn*dkU.z + cs*dkV.z;
+      const tf = rate * df * dt;
+      vx += tanX * tf; vy += tanY * tf; vz += tanZ * tf;
 
-      // radial spring onto the assigned orbit
+      // radial spring onto the assigned orbit, along the in-plane radius
       const rErr = (rTgt - rNow) * DISK_PULL * df * dt;
-      vx += (px2/rNow) * rErr;
-      vy += (py2/rNow) * rErr;
+      const radX = cs*dkU.x + sn*dkV.x;
+      const radY = cs*dkU.y + sn*dkV.y;
+      const radZ = cs*dkU.z + sn*dkV.z;
+      vx += radX * rErr; vy += radY * rErr; vz += radZ * rErr;
 
-      // flatten into the plane, but keep a little thickness
-      const zTgt = diskC.z + diskZ[i] * DISK_THICK;
-      vz += (zTgt - pz) * DISK_FLAT * df * dt;
+      // collapse onto the plane along its normal, keeping a little thickness
+      const hTgt = diskZ[i] * DISK_THICK;
+      const hf2 = (hTgt - h) * DISK_FLAT * df * dt;
+      vx += dkN.x * hf2; vy += dkN.y * hf2; vz += dkN.z * hf2;
     }
 
     // RELEASE BURST — radial shockwave outward from the hold point
